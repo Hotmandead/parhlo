@@ -1,0 +1,57 @@
+# Plan / Documentation (ignored per user request)
+implementation_plan.md
+plan.md
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Secrets and environment variables
+.env
+.env.*
+!.env.example
+credentials.json
+*.pem
+id_rsa*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.venv/
+env/
+venv/
+ENV/
+
+# Swift / Xcode / SPM
+.build/
+Packages
+Package.pins
+Package.resolved
+xcuserdata/
+DerivedData/
+.swiftpm/xcode
+*.xcodeproj/*
+!*.xcodeproj/project.pbxproj
+!*.xcodeproj/xcshareddata/
+*.xcworkspace/*
+!*.xcworkspace/contents.xcworkspacedata
+!*.xcworkspace/xcshareddata/
