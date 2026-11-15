@@ -1,0 +1,20 @@
+services:
+  sidecar:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: dev
+    ports:
+      - "127.0.0.1:8765:8765"
+    env_file:
+      - .env
+    environment:
+      - SIDECAR_HOST=0.0.0.0
+      - SIDECAR_PORT=8765
+    volumes:
+      - ./agent-sidecar:/app/agent-sidecar
+      - sidecar_venv:/opt/venv
+    working_dir: /app/agent-sidecar
+
+volumes:
+  sidecar_venv:

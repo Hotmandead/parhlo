@@ -1,0 +1,15 @@
+.git/
+.gitignore
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+macos-app/
+.build/
+DerivedData/
+implementation_plan.md
+plan.md

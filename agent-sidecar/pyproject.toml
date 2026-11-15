@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=69.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "parhlo-sidecar"
+version = "0.1.0"
+description = "Gemini Live API & spatial grounding sidecar for Parhlo"
+requires-python = ">=3.12"
+dependencies = [
+    "google-genai>=3.2.0",
+    "pydantic>=2.9.0",
+    "websockets>=13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
