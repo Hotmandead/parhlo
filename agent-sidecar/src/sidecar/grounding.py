@@ -3,7 +3,7 @@
 from difflib import SequenceMatcher
 from typing import Sequence
 
-from sidecar.schemas import AXElementBounds, PixelRect, Point2D
+from sidecar.schemas import AXElementBounds, DetectedRectBounds, PixelRect, Point2D
 
 
 def denormalize_box(
@@ -101,4 +101,46 @@ def refine_with_ax_elements(
     return (
         PixelRect(x=best_ax.x, y=best_ax.y, width=best_ax.width, height=best_ax.height),
         best_ax,
+    )
+
+
+def refine_with_detected_rects(
+    rect: PixelRect,
+    detected_rects: Sequence[DetectedRectBounds],
+    iou_threshold: float = 0.35,
+) -> tuple[PixelRect, DetectedRectBounds | None]:
+    """Snap a denormalized rect to the best matching Vision-detected rectangle fallback."""
+    best_candidate: DetectedRectBounds | None = None
+    best_score = 0.0
+
+    for candidate in detected_rects:
+        if candidate.width <= 0 or candidate.height <= 0:
+            continue
+        cand_rect = PixelRect(
+            x=candidate.x,
+            y=candidate.y,
+            width=candidate.width,
+            height=candidate.height,
+        )
+        iou = compute_iou(rect, cand_rect)
+        center_bonus = (
+            0.15 if (_contains_center(cand_rect, rect) or _contains_center(rect, cand_rect)) else 0.0
+        )
+        score = iou + center_bonus + (0.1 * candidate.confidence)
+        qualified = (iou >= iou_threshold) or (center_bonus > 0 and iou >= 0.15)
+        if qualified and score > best_score:
+            best_score = score
+            best_candidate = candidate
+
+    if best_candidate is None:
+        return rect, None
+
+    return (
+        PixelRect(
+            x=best_candidate.x,
+            y=best_candidate.y,
+            width=best_candidate.width,
+            height=best_candidate.height,
+        ),
+        best_candidate,
     )

@@ -190,6 +190,43 @@ public struct SettingsView: View {
                     }
                 }
             }
+
+            darkCard {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Permissions Summary")
+                                .font(.headline)
+                            Text("Live macOS TCC authorization status for capture, AX, mic, and speech.")
+                                .font(.caption)
+                                .foregroundStyle(.white.opacity(0.6))
+                        }
+                        Spacer()
+                        if coordinator.permissionsManager.allGranted {
+                            Label("All Granted", systemImage: "checkmark.seal.fill")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.green)
+                        } else {
+                            Button("Open Permissions Tab") {
+                                selectedTab = .permissions
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
+                    }
+
+                    Divider().overlay(Color.white.opacity(0.08))
+
+                    VStack(spacing: 8) {
+                        permissionStatusRow(title: "Screen Recording", status: coordinator.permissionsManager.screenRecording)
+                        permissionStatusRow(title: "Accessibility", status: coordinator.permissionsManager.accessibility)
+                        permissionStatusRow(title: "Microphone", status: coordinator.permissionsManager.microphone)
+                        permissionStatusRow(title: "Speech Recognition", status: coordinator.permissionsManager.speechRecognition)
+                    }
+                }
+            }
+        }
+        .onAppear {
+            coordinator.permissionsManager.refresh()
         }
     }
 
@@ -265,6 +302,24 @@ public struct SettingsView: View {
             )
 
             darkCard {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Phase 5 Apple Native Intelligence")
+                        .font(.headline)
+                        .foregroundStyle(.white)
+                    Text("On-device Vision (VNRecognizeTextRequest, VNDetectRectanglesRequest, RecognizeDocumentsRequest) combined with semantic PII redaction and fail-closed frame protection.")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.72))
+                    Divider().overlay(Color.white.opacity(0.08))
+                    Label("Semantic PII Redaction (emails, phones, SSNs, payment cards, API keys, private keys)", systemImage: "eye.trianglebadge.exclamationmark")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.82))
+                    Label("Fail-Closed Frame Protection (never transmits unredacted pixels if OCR fails)", systemImage: "lock.shield")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.82))
+                }
+            }
+
+            darkCard {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("EXCLUDED BUNDLE IDENTIFIERS")
                         .font(.caption2.weight(.bold))
@@ -276,6 +331,26 @@ public struct SettingsView: View {
                     }
                 }
             }
+        }
+    }
+
+    private func permissionStatusRow(title: String, status: PermissionStatus) -> some View {
+        let color: Color = switch status {
+        case .granted: .green
+        case .denied: .red
+        case .notDetermined: .orange
+        }
+        return HStack {
+            Text(title)
+                .font(.subheadline)
+                .foregroundStyle(.white.opacity(0.85))
+            Spacer()
+            Text(status.label)
+                .font(.caption2.weight(.semibold))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(color.opacity(0.18), in: Capsule())
+                .foregroundStyle(color)
         }
     }
 

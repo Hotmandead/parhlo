@@ -19,11 +19,21 @@ public struct RedactionResult: Sendable {
     public let image: CGImage
     public let redactedRegionCount: Int
     public let recognizedLineCount: Int
+    public let semanticRedactedLineCount: Int
+    public let sanitizedOCRText: String
 
-    public init(image: CGImage, redactedRegionCount: Int, recognizedLineCount: Int) {
+    public init(
+        image: CGImage,
+        redactedRegionCount: Int,
+        recognizedLineCount: Int,
+        semanticRedactedLineCount: Int = 0,
+        sanitizedOCRText: String = ""
+    ) {
         self.image = image
         self.redactedRegionCount = redactedRegionCount
         self.recognizedLineCount = recognizedLineCount
+        self.semanticRedactedLineCount = semanticRedactedLineCount
+        self.sanitizedOCRText = sanitizedOCRText
     }
 }
 
@@ -57,11 +67,15 @@ public actor VisionRedactor {
     public nonisolated let recognitionLevel: VNRequestTextRecognitionLevel
     public nonisolated let preferCPUOnly: Bool
     private let compiledRegexes: CompiledRegexList
+    private var semanticClassifier: (any SemanticPIIClassifying)?
+    private var semanticPrivacyEnabled: Bool
 
     public init(
         customPatterns: [String] = [],
         recognitionLevel: VNRequestTextRecognitionLevel = .accurate,
-        preferCPUOnly: Bool = false
+        preferCPUOnly: Bool = false,
+        semanticClassifier: (any SemanticPIIClassifying)? = nil,
+        semanticPrivacyEnabled: Bool = false
     ) {
         let allPatterns = Self.defaultPatterns + customPatterns.filter {
             !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -70,6 +84,21 @@ public actor VisionRedactor {
         self.recognitionLevel = recognitionLevel
         self.preferCPUOnly = preferCPUOnly
         self.compiledRegexes = CompiledRegexList(patterns: allPatterns)
+        self.semanticClassifier = semanticClassifier ?? (semanticPrivacyEnabled ? HeuristicSemanticPIIClassifier() : nil)
+        self.semanticPrivacyEnabled = semanticPrivacyEnabled
+    }
+
+    /// Updates semantic privacy classification state and optionally replaces the semantic classifier.
+    public func setSemanticPrivacy(
+        enabled: Bool,
+        classifier: (any SemanticPIIClassifying)? = nil
+    ) {
+        self.semanticPrivacyEnabled = enabled
+        if let classifier {
+            self.semanticClassifier = classifier
+        } else if enabled && self.semanticClassifier == nil {
+            self.semanticClassifier = HeuristicSemanticPIIClassifier()
+        }
     }
 
     /// Pure synchronous helper checking whether `text` matches any configured sensitive pattern.
@@ -79,19 +108,18 @@ public actor VisionRedactor {
 
     /// Returns all character ranges in `text` matching any configured sensitive pattern.
     nonisolated public func sensitiveRanges(in text: String) -> [Range<String.Index>] {
-        guard !text.isEmpty else { return [] }
-        let fullRange = NSRange(text.startIndex..<text.endIndex, in: text)
-        var ranges: [Range<String.Index>] = []
+        Self.matchingRanges(in: text, using: compiledRegexes.expressions)
+    }
 
-        for regex in compiledRegexes.expressions {
-            let matches = regex.matches(in: text, options: [], range: fullRange)
-            for match in matches {
-                if let swiftRange = Range(match.range, in: text) {
-                    ranges.append(swiftRange)
-                }
-            }
+    /// Replaces all regex-matched sensitive ranges in `text` with `"[REDACTED]"` from end to start.
+    nonisolated public func redactSensitiveText(_ text: String) -> String {
+        let ranges = Self.mergedRanges(sensitiveRanges(in: text))
+        guard !ranges.isEmpty else { return text }
+        var redacted = text
+        for range in ranges.reversed() {
+            redacted.replaceSubrange(range, with: "[REDACTED]")
         }
-        return ranges
+        return redacted
     }
 
     /// Runs Vision OCR off `@MainActor` and paints solid black masks over detected sensitive text.
@@ -104,6 +132,8 @@ public actor VisionRedactor {
         let level = recognitionLevel
         let cpuOnly = preferCPUOnly
         let regexList = compiledRegexes
+        let isSemanticEnabled = semanticPrivacyEnabled
+        let classifier = semanticClassifier
 
         return await Task.detached(priority: .userInitiated) {
             let request = VNRecognizeTextRequest()
@@ -122,17 +152,40 @@ public actor VisionRedactor {
             do {
                 try handler.perform([request])
             } catch {
-                return RedactionResult(image: image, redactedRegionCount: 0, recognizedLineCount: 0)
+                // Fail closed on Vision OCR error by masking the full frame bounds.
+                let fullBoundsMask = [CGRect(x: 0, y: 0, width: 1, height: 1)]
+                let masked = Self.applyBlackMasks(to: image, normalizedBoxes: fullBoundsMask)
+                return RedactionResult(
+                    image: masked,
+                    redactedRegionCount: 1,
+                    recognizedLineCount: 0,
+                    semanticRedactedLineCount: 0,
+                    sanitizedOCRText: ""
+                )
             }
 
             let observations = request.results ?? []
             var normalizedBoxes: [CGRect] = []
 
+            struct RecognizedLine {
+                let observation: VNRecognizedTextObservation
+                let text: String
+                let regexMatched: Bool
+            }
+
+            var recognizedLines: [RecognizedLine] = []
+            recognizedLines.reserveCapacity(observations.count)
+
             for observation in observations {
                 guard let candidate = observation.topCandidates(1).first else { continue }
                 let text = candidate.string
                 let ranges = Self.matchingRanges(in: text, using: regexList.expressions)
-                guard !ranges.isEmpty else { continue }
+                guard !ranges.isEmpty else {
+                    recognizedLines.append(
+                        RecognizedLine(observation: observation, text: text, regexMatched: false)
+                    )
+                    continue
+                }
 
                 var addedSubBox = false
                 for range in ranges {
@@ -144,13 +197,49 @@ public actor VisionRedactor {
                 if !addedSubBox {
                     normalizedBoxes.append(observation.boundingBox)
                 }
+                recognizedLines.append(
+                    RecognizedLine(observation: observation, text: text, regexMatched: true)
+                )
             }
+
+            var semanticFlaggedLineIndices: Set<Int> = []
+            var semanticRedactedLineCount = 0
+
+            if isSemanticEnabled, let classifier {
+                let unmatchedLineIndices = recognizedLines.indices.filter { !recognizedLines[$0].regexMatched }
+                if !unmatchedLineIndices.isEmpty {
+                    let unmatchedTexts = unmatchedLineIndices.map { recognizedLines[$0].text }
+                    let flaggedUnmatched = await Self.classifyWithTimeout(
+                        lines: unmatchedTexts,
+                        using: classifier,
+                        timeoutNanoseconds: 400_000_000
+                    )
+                    for unmatchedIndex in flaggedUnmatched.sorted() {
+                        guard unmatchedIndex >= 0 && unmatchedIndex < unmatchedLineIndices.count else {
+                            continue
+                        }
+                        let recognizedIndex = unmatchedLineIndices[unmatchedIndex]
+                        semanticFlaggedLineIndices.insert(recognizedIndex)
+                        normalizedBoxes.append(recognizedLines[recognizedIndex].observation.boundingBox)
+                        semanticRedactedLineCount += 1
+                    }
+                }
+            }
+
+            let sanitizedOCRText = recognizedLines.enumerated().map { index, line in
+                if line.regexMatched || semanticFlaggedLineIndices.contains(index) {
+                    return "[REDACTED]"
+                }
+                return line.text
+            }.joined(separator: "\n")
 
             guard !normalizedBoxes.isEmpty else {
                 return RedactionResult(
                     image: image,
                     redactedRegionCount: 0,
-                    recognizedLineCount: observations.count
+                    recognizedLineCount: observations.count,
+                    semanticRedactedLineCount: 0,
+                    sanitizedOCRText: sanitizedOCRText
                 )
             }
 
@@ -158,9 +247,31 @@ public actor VisionRedactor {
             return RedactionResult(
                 image: masked,
                 redactedRegionCount: normalizedBoxes.count,
-                recognizedLineCount: observations.count
+                recognizedLineCount: observations.count,
+                semanticRedactedLineCount: semanticRedactedLineCount,
+                sanitizedOCRText: sanitizedOCRText
             )
         }.value
+    }
+
+    private nonisolated static func classifyWithTimeout(
+        lines: [String],
+        using classifier: any SemanticPIIClassifying,
+        timeoutNanoseconds: UInt64
+    ) async -> Set<Int> {
+        await withTaskGroup(of: Set<Int>?.self) { group in
+            group.addTask {
+                try? await classifier.classifySensitiveLineIndices(lines)
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+                return nil
+            }
+
+            let firstResult = await group.next() ?? nil
+            group.cancelAll()
+            return firstResult ?? []
+        }
     }
 
     private nonisolated static func matchingRanges(
@@ -179,6 +290,29 @@ public actor VisionRedactor {
             }
         }
         return ranges
+    }
+
+    private nonisolated static func mergedRanges(
+        _ ranges: [Range<String.Index>]
+    ) -> [Range<String.Index>] {
+        guard !ranges.isEmpty else { return [] }
+        let sorted = ranges.sorted {
+            if $0.lowerBound != $1.lowerBound {
+                return $0.lowerBound < $1.lowerBound
+            }
+            return $0.upperBound < $1.upperBound
+        }
+        var merged: [Range<String.Index>] = [sorted[0]]
+        for current in sorted.dropFirst() {
+            let last = merged[merged.count - 1]
+            if current.lowerBound <= last.upperBound {
+                let newUpper = max(last.upperBound, current.upperBound)
+                merged[merged.count - 1] = last.lowerBound..<newUpper
+            } else {
+                merged.append(current)
+            }
+        }
+        return merged
     }
 
     private nonisolated static func applyBlackMasks(

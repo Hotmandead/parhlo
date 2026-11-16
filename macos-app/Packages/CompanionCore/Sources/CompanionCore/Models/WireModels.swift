@@ -32,6 +32,111 @@ public struct AXElementBounds: Codable, Sendable, Equatable {
     }
 }
 
+/// Vision-detected UI rectangle fallback in top-left origin pixel coordinates matching `schemas.DetectedRectBounds`.
+public struct DetectedRectBounds: Codable, Sendable, Equatable {
+    public let x: Int
+    public let y: Int
+    public let width: Int
+    public let height: Int
+    public let confidence: Double
+
+    enum CodingKeys: String, CodingKey {
+        case x
+        case y
+        case width
+        case height
+        case confidence
+    }
+
+    public init(
+        x: Int,
+        y: Int,
+        width: Int,
+        height: Int,
+        confidence: Double = 1.0
+    ) {
+        self.x = x
+        self.y = y
+        self.width = max(1, width)
+        self.height = max(1, height)
+        self.confidence = min(1.0, max(0.0, confidence))
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.x = try container.decode(Int.self, forKey: .x)
+        self.y = try container.decode(Int.self, forKey: .y)
+        self.width = max(1, try container.decode(Int.self, forKey: .width))
+        self.height = max(1, try container.decode(Int.self, forKey: .height))
+        let decodedConfidence = try container.decodeIfPresent(Double.self, forKey: .confidence) ?? 1.0
+        self.confidence = min(1.0, max(0.0, decodedConfidence))
+    }
+}
+
+/// Bounded structured table extracted from an on-screen document matching `schemas.DocumentTableSummary`.
+public struct DocumentTableSummary: Codable, Sendable, Equatable {
+    public let rows: [[String]]
+
+    enum CodingKeys: String, CodingKey {
+        case rows
+    }
+
+    public init(rows: [[String]] = []) {
+        self.rows = Array(rows.prefix(12))
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let decodedRows = try container.decodeIfPresent([[String]].self, forKey: .rows) ?? []
+        self.rows = Array(decodedRows.prefix(12))
+    }
+}
+
+/// Redacted, bounded document structure extracted from on-screen content matching `schemas.DocumentContext`.
+public struct DocumentContext: Codable, Sendable, Equatable {
+    public let title: String?
+    public let paragraphs: [String]
+    public let tables: [DocumentTableSummary]
+    public let truncated: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case title
+        case paragraphs
+        case tables
+        case truncated
+    }
+
+    public init(
+        title: String? = nil,
+        paragraphs: [String] = [],
+        tables: [DocumentTableSummary] = [],
+        truncated: Bool = false
+    ) {
+        if let title, title.count > 160 {
+            self.title = String(title.prefix(160))
+        } else {
+            self.title = title
+        }
+        self.paragraphs = Array(paragraphs.prefix(16))
+        self.tables = Array(tables.prefix(2))
+        self.truncated = truncated
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if let decodedTitle = try container.decodeIfPresent(String.self, forKey: .title) {
+            self.title = decodedTitle.count > 160 ? String(decodedTitle.prefix(160)) : decodedTitle
+        } else {
+            self.title = nil
+        }
+        let decodedParagraphs = try container.decodeIfPresent([String].self, forKey: .paragraphs) ?? []
+        self.paragraphs = Array(decodedParagraphs.prefix(16))
+        let decodedTables = try container.decodeIfPresent([DocumentTableSummary].self, forKey: .tables) ?? []
+        self.tables = Array(decodedTables.prefix(2))
+        self.truncated = try container.decodeIfPresent(Bool.self, forKey: .truncated) ?? false
+    }
+}
+
 /// Session lifecycle actions matching `schemas.SessionControlMessage.action`.
 public enum SessionControlAction: String, Codable, Sendable, Equatable {
     case startSession = "start_session"
@@ -65,6 +170,8 @@ public struct ScreenContextMessage: Codable, Sendable, Equatable {
     public let jpegB64: String
     public let axElements: [AXElementBounds]
     public let frontmostBundleId: String?
+    public let detectedRects: [DetectedRectBounds]
+    public let documentContext: DocumentContext?
 
     enum CodingKeys: String, CodingKey {
         case type
@@ -74,6 +181,8 @@ public struct ScreenContextMessage: Codable, Sendable, Equatable {
         case jpegB64 = "jpeg_b64"
         case axElements = "ax_elements"
         case frontmostBundleId = "frontmost_bundle_id"
+        case detectedRects = "detected_rects"
+        case documentContext = "document_context"
     }
 
     public init(
@@ -83,7 +192,9 @@ public struct ScreenContextMessage: Codable, Sendable, Equatable {
         scaleFactor: Double = 1.0,
         jpegB64: String,
         axElements: [AXElementBounds] = [],
-        frontmostBundleId: String? = nil
+        frontmostBundleId: String? = nil,
+        detectedRects: [DetectedRectBounds] = [],
+        documentContext: DocumentContext? = nil
     ) {
         self.type = type
         self.screenWidth = max(1, screenWidth)
@@ -92,6 +203,8 @@ public struct ScreenContextMessage: Codable, Sendable, Equatable {
         self.jpegB64 = jpegB64
         self.axElements = axElements
         self.frontmostBundleId = frontmostBundleId
+        self.detectedRects = detectedRects
+        self.documentContext = documentContext
     }
 
     public init(from decoder: Decoder) throws {
@@ -104,6 +217,8 @@ public struct ScreenContextMessage: Codable, Sendable, Equatable {
         self.jpegB64 = try container.decode(String.self, forKey: .jpegB64)
         self.axElements = try container.decodeIfPresent([AXElementBounds].self, forKey: .axElements) ?? []
         self.frontmostBundleId = try container.decodeIfPresent(String.self, forKey: .frontmostBundleId)
+        self.detectedRects = try container.decodeIfPresent([DetectedRectBounds].self, forKey: .detectedRects) ?? []
+        self.documentContext = try container.decodeIfPresent(DocumentContext.self, forKey: .documentContext)
     }
 }
 

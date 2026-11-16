@@ -13,7 +13,7 @@ A native macOS screen-aware AI assistant optimized for Apple Silicon (`arm64-app
 | **Phase 2: Native macOS Overlay** | Completed | `macos-app/` (`Parhlo.xcodeproj`, `PermissionsManager`, `OverlayWindowController`, `CAShapeLayer` + SwiftUI) |
 | **Phase 3: Capture, Vision Redaction & Bridge** | Completed | `PrivacyFilter`, `VisionRedactor`, `AXInspector`, `CaptureEngine`, `SidecarWebSocketClient` |
 | **Phase 4: Bidirectional Audio, Hotkey & E2E** | Completed | `AudioEngineManager` (`AVAudioEngine` AEC), `GlobalHotkeyManager` (`Control+Option`), `AppCoordinator`, `SettingsView`, E2E check |
-| **Phase 5: Apple Native Intelligence Upgrades** | Planned | Vision `DetectRectanglesRequest` / `RecognizeDocumentsRequest`, optional `FoundationModels` + `AVSpeechSynthesizer` |
+| **Phase 5: Apple Native Intelligence Upgrades** | Completed | `VisionGrounder` (`VNDetectRectanglesRequest` + `RecognizeDocumentsRequest`), `SemanticPrivacyClassifier` (`FoundationModels` + LRU cache), `OfflineAssistantEngine` + `OfflineSpeechManager` (`AVSpeechSynthesizer`) |
 
 ## Quick Start
 

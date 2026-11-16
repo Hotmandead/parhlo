@@ -21,6 +21,13 @@ public struct PermissionsOnboardingView: View {
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
+                Spacer()
+                if !manager.allGranted {
+                    Button("Request All Missing") {
+                        requestAllMissing()
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
             }
 
             Divider()
@@ -67,25 +74,44 @@ public struct PermissionsOnboardingView: View {
                 )
             }
 
-            HStack {
+            HStack(alignment: .center, spacing: 12) {
                 if manager.allGranted {
                     Label("All permissions granted", systemImage: "checkmark.seal.fill")
                         .foregroundStyle(.green)
                         .font(.subheadline.weight(.medium))
                 } else {
-                    Text("Screen Recording changes may require restarting Parhlo.")
+                    Text("Tip: If you already toggled a permission ON in System Settings after a rebuild, remove (-) Parhlo in System Settings and re-add it, then relaunch Parhlo.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer()
                 Button("Refresh Status") {
                     manager.refresh()
                 }
+                .buttonStyle(.bordered)
             }
         }
-        .padding(22)
-        .frame(width: 520)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .onAppear {
+            manager.refresh()
+        }
+    }
+
+    private func requestAllMissing() {
+        Task { @MainActor in
+            if manager.screenRecording != .granted {
+                manager.requestScreenRecording()
+            }
+            if manager.accessibility != .granted {
+                manager.requestAccessibility()
+            }
+            if manager.microphone != .granted {
+                await manager.requestMicrophone()
+            }
+            if manager.speechRecognition != .granted {
+                await manager.requestSpeechRecognition()
+            }
             manager.refresh()
         }
     }

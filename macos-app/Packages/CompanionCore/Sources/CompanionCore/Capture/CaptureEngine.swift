@@ -33,8 +33,9 @@ public final class CaptureEngine {
     public private(set) var lastCaptureDate: Date?
 
     @ObservationIgnored private let privacyFilter: PrivacyFilter
-    @ObservationIgnored private let redactor: VisionRedactor
+    @ObservationIgnored public let redactor: VisionRedactor
     @ObservationIgnored private let axInspector: AXInspector
+    @ObservationIgnored private let visionGrounder: VisionGrounder
     @ObservationIgnored private let ownBundleID: String
     @ObservationIgnored private let ownPID: pid_t
     @ObservationIgnored private let jpegQuality: Double
@@ -45,6 +46,7 @@ public final class CaptureEngine {
         privacyFilter: PrivacyFilter,
         redactor: VisionRedactor = VisionRedactor(),
         axInspector: AXInspector = AXInspector(),
+        visionGrounder: VisionGrounder = VisionGrounder(),
         ownBundleID: String = Bundle.main.bundleIdentifier ?? "com.parhlo.ScreenCompanionApp",
         ownPID: pid_t = ProcessInfo.processInfo.processIdentifier,
         jpegQuality: Double = CaptureEngine.defaultJPEGQuality
@@ -52,6 +54,7 @@ public final class CaptureEngine {
         self.privacyFilter = privacyFilter
         self.redactor = redactor
         self.axInspector = axInspector
+        self.visionGrounder = visionGrounder
         self.ownBundleID = ownBundleID
         self.ownPID = ownPID
         self.jpegQuality = min(1.0, max(0.1, jpegQuality))
@@ -143,12 +146,31 @@ public final class CaptureEngine {
             throw CaptureError.privacyPaused(bundleID: privacyFilter.frontmostBundleID)
         }
 
-        async let redactedImage = redactor.redact(image: snapshot.image)
+        async let redaction = redactor.redactWithDetails(image: snapshot.image)
         async let axElements: [AXElementBounds] = frontmostPID > 0
             ? axInspector.inspect(pid: frontmostPID, screenBounds: snapshot.displayBounds)
             : []
 
-        let (finalImage, elements) = await (redactedImage, axElements)
+        let (redactionResult, elements) = await (redaction, axElements)
+        let finalImage = redactionResult.image
+
+        guard !privacyFilter.isPaused else {
+            throw CaptureError.privacyPaused(bundleID: privacyFilter.frontmostBundleID)
+        }
+
+        let screenSize = CGSize(width: snapshot.logicalWidth, height: snapshot.logicalHeight)
+        let detectedRects: [DetectedRectBounds]
+        if AXInspector.isSparseTree(elements) {
+            detectedRects = await visionGrounder.detectRectangles(in: finalImage, screenSize: screenSize)
+        } else {
+            detectedRects = []
+        }
+
+        let documentContext = await visionGrounder.extractDocumentContext(
+            from: finalImage,
+            redactor: redactor,
+            fallbackText: redactionResult.sanitizedOCRText
+        )
 
         guard !privacyFilter.isPaused else {
             throw CaptureError.privacyPaused(bundleID: privacyFilter.frontmostBundleID)
@@ -162,6 +184,8 @@ public final class CaptureEngine {
                 screenHeight: snapshot.logicalHeight,
                 scaleFactor: scaleFactor,
                 axElements: elements,
+                detectedRects: detectedRects,
+                documentContext: documentContext,
                 frontmostBundleId: frontmostBundleID,
                 jpegQuality: quality
             )
@@ -169,6 +193,46 @@ public final class CaptureEngine {
 
         lastCaptureDate = Date()
         return message
+    }
+
+    /// Captures a redacted on-device `OfflineScreenContext` snapshot without JPEG encoding for offline Q&A.
+    public func captureOfflineContext() async throws -> OfflineScreenContext {
+        let frontmost = NSWorkspace.shared.frontmostApplication
+        let appName = frontmost?.localizedName
+        let bundleID = frontmost?.bundleIdentifier
+        privacyFilter.evaluateFrontmostApplication(bundleIdentifier: bundleID, appName: appName)
+
+        guard !privacyFilter.isPaused else {
+            throw CaptureError.privacyPaused(bundleID: privacyFilter.frontmostBundleID)
+        }
+
+        let frontmostPID = frontmost?.processIdentifier ?? 0
+        let snapshot = try await Self.captureDisplaySnapshot(
+            ownBundleID: ownBundleID,
+            ownPID: ownPID,
+            excludedBundleIDs: privacyFilter.excludedBundleIDs
+        )
+
+        guard !privacyFilter.isPaused else {
+            throw CaptureError.privacyPaused(bundleID: privacyFilter.frontmostBundleID)
+        }
+
+        async let redaction = redactor.redactWithDetails(image: snapshot.image)
+        async let axElements: [AXElementBounds] = frontmostPID > 0
+            ? axInspector.inspect(pid: frontmostPID, screenBounds: snapshot.displayBounds)
+            : []
+
+        let (redactionResult, elements) = await (redaction, axElements)
+        guard !privacyFilter.isPaused else {
+            throw CaptureError.privacyPaused(bundleID: privacyFilter.frontmostBundleID)
+        }
+
+        return OfflineScreenContext(
+            sanitizedOCRText: redactionResult.sanitizedOCRText,
+            axElements: elements,
+            frontmostBundleID: bundleID,
+            frontmostAppName: appName
+        )
     }
 
     /// Encodes a `CGImage` to JPEG `Data` at `quality` (default `0.65`) off `@MainActor`.
@@ -203,6 +267,8 @@ public final class CaptureEngine {
         screenHeight: Int,
         scaleFactor: Double,
         axElements: [AXElementBounds],
+        detectedRects: [DetectedRectBounds] = [],
+        documentContext: DocumentContext? = nil,
         frontmostBundleId: String?,
         jpegQuality: Double = CaptureEngine.defaultJPEGQuality
     ) throws -> ScreenContextMessage {
@@ -215,7 +281,9 @@ public final class CaptureEngine {
             scaleFactor: scaleFactor,
             jpegB64: jpegData.base64EncodedString(),
             axElements: axElements,
-            frontmostBundleId: frontmostBundleId
+            frontmostBundleId: frontmostBundleId,
+            detectedRects: detectedRects,
+            documentContext: documentContext
         )
     }
 

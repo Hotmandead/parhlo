@@ -1,3 +1,4 @@
+@preconcurrency import AVFoundation
 import Foundation
 import Testing
 @testable import CompanionCore
@@ -108,6 +109,79 @@ struct SpeechAndTextBridgeTests {
         #expect(coordinator.audioManager.isOutputMuted == true)
         coordinator.setOutputMuted(false)
         #expect(coordinator.audioManager.isOutputMuted == false)
+
+        coordinator.webSocketClient.disconnect()
+    }
+
+    @Test("SpeechRecognitionManager normalizes multi-channel mic buffers to mono Float32 PCM")
+    func speechBufferNormalization() throws {
+        let monoFormat = try #require(AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 44_100,
+            channels: 1,
+            interleaved: false
+        ))
+        let monoBuffer = try #require(AVAudioPCMBuffer(pcmFormat: monoFormat, frameCapacity: 512))
+        monoBuffer.frameLength = 512
+        var converter: AVAudioConverter?
+        var sourceFormat: AVAudioFormat?
+
+        let passthrough = try #require(SpeechRecognitionManager.normalizeBufferForSpeech(
+            monoBuffer,
+            cachedConverter: &converter,
+            cachedSourceFormat: &sourceFormat
+        ))
+        #expect(passthrough === monoBuffer)
+        #expect(converter == nil)
+
+        let discrete3ChLayout = try #require(AVAudioChannelLayout(layoutTag: kAudioChannelLayoutTag_DiscreteInOrder | 3))
+        let multiChannelFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 44_100,
+            interleaved: false,
+            channelLayout: discrete3ChLayout
+        )
+        let multiBuffer = try #require(AVAudioPCMBuffer(pcmFormat: multiChannelFormat, frameCapacity: 512))
+        multiBuffer.frameLength = 512
+        if let channels = multiBuffer.floatChannelData {
+            for frame in 0..<512 {
+                channels[0][frame] = 0.25
+                channels[1][frame] = 0.25
+                channels[2][frame] = 0.25
+            }
+        }
+
+        let normalized = try #require(SpeechRecognitionManager.normalizeBufferForSpeech(
+            multiBuffer,
+            cachedConverter: &converter,
+            cachedSourceFormat: &sourceFormat
+        ))
+        #expect(normalized.format.channelCount == 1)
+        #expect(normalized.format.commonFormat == .pcmFormatFloat32)
+        #expect(normalized.frameLength > 0)
+    }
+
+    @Test("AppCoordinator surfaces audio and speech error callbacks into overlayStore")
+    @MainActor
+    func surfacesAudioAndSpeechErrors() async {
+        let store = OverlayStateStore()
+        let coordinator = AppCoordinator(
+            sidecarURL: URL(string: "ws://127.0.0.1:1")!,
+            overlayStore: store
+        )
+        let initialCount = store.messages.count
+
+        coordinator.audioManager.onError?("Hardware tap stalled")
+        try? await Task.sleep(for: .milliseconds(50))
+
+        #expect(coordinator.lastStatusError == "Audio start failed: Hardware tap stalled")
+        #expect(store.messages.count == initialCount + 1)
+        #expect(store.messages.last?.text == "Audio start failed: Hardware tap stalled")
+
+        // Duplicate identical audio error should not spam chat history.
+        coordinator.audioManager.onError?("Hardware tap stalled")
+        try? await Task.sleep(for: .milliseconds(50))
+        #expect(store.messages.count == initialCount + 1)
 
         coordinator.webSocketClient.disconnect()
     }

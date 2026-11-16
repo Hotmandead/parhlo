@@ -1,6 +1,7 @@
 @preconcurrency import AVFoundation
 import Foundation
 import Observation
+import os
 
 /// Errors raised by `AudioEngineManager` during audio graph configuration or conversion.
 public enum AudioEngineError: Error, Sendable, Equatable {
@@ -83,17 +84,20 @@ public final class AudioEngineManager {
                     }
                 }
             },
-            onFinished: { [weak self] result in
+            onEvent: { [weak self] event in
                 Task { @MainActor [weak self] in
                     guard let self, self.sessionGeneration == gen else { return }
-                    switch result {
-                    case .success(let voiceProcessingActive):
+                    switch event {
+                    case .started(let voiceProcessingActive):
                         self.isVoiceProcessingActive = voiceProcessingActive
-                    case .failure(let error):
+                    case .fellBackToStandardCapture:
+                        self.isVoiceProcessingActive = false
+                    case .failed(let message):
                         self.isRunning = false
                         self.isPlaybackRunning = false
                         self.isVoiceProcessingActive = false
-                        self.onError?(error.localizedDescription)
+                        self.inputRMSLevel = 0
+                        self.onError?(message)
                     }
                 }
             }
@@ -202,9 +206,11 @@ public final class AudioEngineManager {
         upTargetFormat: AVAudioFormat,
         chunkCallback: (@Sendable (Data) -> Void)?,
         rawBufferCallback: (@Sendable (AVAudioPCMBuffer) -> Void)?,
+        onBufferDelivered: @escaping @Sendable () -> Void,
         onRMS: @escaping @Sendable (Float) -> Void
     ) {
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
+            onBufferDelivered()
             rawBufferCallback?(buffer)
 
             guard let pcmData = convertToPCMInt16Data(
@@ -342,6 +348,28 @@ public final class AudioEngineManager {
     }
 }
 
+private enum CaptureGraphEvent: Sendable {
+    case started(voiceProcessingActive: Bool)
+    case fellBackToStandardCapture
+    case failed(String)
+}
+
+private final class TapDeliveryFlag: @unchecked Sendable {
+    private let lock = OSAllocatedUnfairLock<Bool>(initialState: false)
+
+    func markDelivered() {
+        lock.withLock { delivered in
+            if !delivered {
+                delivered = true
+            }
+        }
+    }
+
+    var hasDelivered: Bool {
+        lock.withLock { $0 }
+    }
+}
+
 /// Owns `AVAudioEngine` lifecycle and audio graph operations on a dedicated Default-QoS serial queue
 /// so `@MainActor` (`User-interactive`) never blocks on CoreAudio's `Default`-QoS internal threads.
 private final class AudioGraphWorker: @unchecked Sendable {
@@ -356,6 +384,7 @@ private final class AudioGraphWorker: @unchecked Sendable {
     private var isPlaybackActive: Bool = false
     private var activeScheduledBuffers: Int = 0
     private var playbackGeneration: UInt64 = 0
+    private var captureGeneration: UInt64 = 0
 
     deinit {
         let engine = self.engine
@@ -379,7 +408,7 @@ private final class AudioGraphWorker: @unchecked Sendable {
         chunkCallback: (@Sendable (Data) -> Void)?,
         rawBufferCallback: (@Sendable (AVAudioPCMBuffer) -> Void)?,
         onRMS: @escaping @Sendable (Float) -> Void,
-        onFinished: @escaping @Sendable (Result<Bool, any Error>) -> Void
+        onEvent: @escaping @Sendable (CaptureGraphEvent) -> Void
     ) {
         queue.async { [weak self] in
             guard let self else { return }
@@ -387,75 +416,143 @@ private final class AudioGraphWorker: @unchecked Sendable {
                 if self.isCapturing || self.isPlaybackActive {
                     self.teardownOnQueue()
                 }
-
-                let audioEngine = AVAudioEngine()
-                let player = AVAudioPlayerNode()
-                audioEngine.attach(player)
-
-                let inputNode = audioEngine.inputNode
-                let voiceProcessingActive: Bool
-                if voiceProcessingEnabled {
-                    do {
-                        try inputNode.setVoiceProcessingEnabled(true)
-                        voiceProcessingActive = true
-                    } catch {
-                        // Keep running if hardware/virtual device rejects voice processing.
-                        voiceProcessingActive = false
-                    }
-                } else {
-                    voiceProcessingActive = false
-                }
-
-                let mainMixer = audioEngine.mainMixerNode
-                let mixerFormat = mainMixer.outputFormat(forBus: 0)
-                audioEngine.connect(player, to: mainMixer, format: mixerFormat)
-
-                guard let downConverter = AVAudioConverter(from: downSourceFormat, to: mixerFormat) else {
-                    throw AudioEngineError.converterInitializationFailed
-                }
-
-                let hardwareInputFormat = inputNode.outputFormat(forBus: 0)
-                guard hardwareInputFormat.sampleRate > 0, hardwareInputFormat.channelCount > 0 else {
-                    throw AudioEngineError.unsupportedFormat
-                }
-                guard let upConverter = AVAudioConverter(from: hardwareInputFormat, to: upTargetFormat) else {
-                    throw AudioEngineError.converterInitializationFailed
-                }
-
-                inputNode.removeTap(onBus: 0)
-                AudioEngineManager.installInputTap(
-                    on: inputNode,
-                    format: hardwareInputFormat,
-                    upConverter: upConverter,
+                let voiceProcessingActive = try self.startCaptureAndPlaybackOnQueue(
+                    voiceProcessingEnabled: voiceProcessingEnabled,
+                    downSourceFormat: downSourceFormat,
                     upTargetFormat: upTargetFormat,
                     chunkCallback: chunkCallback,
                     rawBufferCallback: rawBufferCallback,
-                    onRMS: onRMS
+                    onRMS: onRMS,
+                    onEvent: onEvent
                 )
-
-                do {
-                    audioEngine.prepare()
-                    try audioEngine.start()
-                    player.play()
-                } catch {
-                    inputNode.removeTap(onBus: 0)
-                    throw AudioEngineError.engineStartFailed(error.localizedDescription)
-                }
-
-                self.engine = audioEngine
-                self.playerNode = player
-                self.playbackConverter = downConverter
-                self.playbackSourceFormat = downSourceFormat
-                self.playbackTargetFormat = mixerFormat
-                self.activeScheduledBuffers = 0
-                self.isCapturing = true
-                self.isPlaybackActive = true
-
-                onFinished(.success(voiceProcessingActive))
+                onEvent(.started(voiceProcessingActive: voiceProcessingActive))
             } catch {
-                onFinished(.failure(error))
+                onEvent(.failed(error.localizedDescription))
             }
         }
+    }
+
+    private func startCaptureAndPlaybackOnQueue(
+        voiceProcessingEnabled: Bool,
+        downSourceFormat: AVAudioFormat,
+        upTargetFormat: AVAudioFormat,
+        chunkCallback: (@Sendable (Data) -> Void)?,
+        rawBufferCallback: (@Sendable (AVAudioPCMBuffer) -> Void)?,
+        onRMS: @escaping @Sendable (Float) -> Void,
+        onEvent: @escaping @Sendable (CaptureGraphEvent) -> Void
+    ) throws -> Bool {
+        var audioEngine = AVAudioEngine()
+        var player = AVAudioPlayerNode()
+        audioEngine.attach(player)
+
+        // Ensure the output graph nodes exist before toggling voice processing on macOS CoreAudio.
+        _ = audioEngine.mainMixerNode
+        _ = audioEngine.outputNode
+
+        let voiceProcessingActive: Bool
+        if voiceProcessingEnabled {
+            do {
+                try audioEngine.inputNode.setVoiceProcessingEnabled(true)
+                voiceProcessingActive = true
+            } catch {
+                // Rebuild a fresh graph without AUVoiceProcessor if the aggregate device fails synchronously.
+                audioEngine = AVAudioEngine()
+                player = AVAudioPlayerNode()
+                audioEngine.attach(player)
+                _ = audioEngine.mainMixerNode
+                _ = audioEngine.outputNode
+                voiceProcessingActive = false
+            }
+        } else {
+            voiceProcessingActive = false
+        }
+
+        let inputNode = audioEngine.inputNode
+        let mainMixer = audioEngine.mainMixerNode
+        let mixerFormat = mainMixer.outputFormat(forBus: 0)
+        audioEngine.connect(player, to: mainMixer, format: mixerFormat)
+
+        guard let downConverter = AVAudioConverter(from: downSourceFormat, to: mixerFormat) else {
+            throw AudioEngineError.converterInitializationFailed
+        }
+
+        let hardwareInputFormat = inputNode.outputFormat(forBus: 0)
+        guard hardwareInputFormat.sampleRate > 0, hardwareInputFormat.channelCount > 0 else {
+            throw AudioEngineError.unsupportedFormat
+        }
+        guard let upConverter = AVAudioConverter(from: hardwareInputFormat, to: upTargetFormat) else {
+            throw AudioEngineError.converterInitializationFailed
+        }
+
+        let tapFlag = TapDeliveryFlag()
+        inputNode.removeTap(onBus: 0)
+        AudioEngineManager.installInputTap(
+            on: inputNode,
+            format: hardwareInputFormat,
+            upConverter: upConverter,
+            upTargetFormat: upTargetFormat,
+            chunkCallback: chunkCallback,
+            rawBufferCallback: rawBufferCallback,
+            onBufferDelivered: {
+                tapFlag.markDelivered()
+            },
+            onRMS: onRMS
+        )
+
+        do {
+            audioEngine.prepare()
+            try audioEngine.start()
+            player.play()
+        } catch {
+            inputNode.removeTap(onBus: 0)
+            throw AudioEngineError.engineStartFailed(error.localizedDescription)
+        }
+
+        captureGeneration &+= 1
+        let activeCaptureGen = captureGeneration
+        self.engine = audioEngine
+        self.playerNode = player
+        self.playbackConverter = downConverter
+        self.playbackSourceFormat = downSourceFormat
+        self.playbackTargetFormat = mixerFormat
+        self.activeScheduledBuffers = 0
+        self.isCapturing = true
+        self.isPlaybackActive = true
+
+        // Watchdog: AUVoiceProcessor on macOS can return from start() without throwing while HAL StartIO
+        // fails with error 35 / -10877 and delivers zero tap buffers. Fall back to non-VP capture automatically.
+        let watchdogDelay: DispatchTimeInterval = voiceProcessingActive ? .milliseconds(900) : .milliseconds(1500)
+        queue.asyncAfter(deadline: .now() + watchdogDelay) { [weak self] in
+            guard let self,
+                  self.isCapturing,
+                  self.captureGeneration == activeCaptureGen,
+                  !tapFlag.hasDelivered else {
+                return
+            }
+
+            if voiceProcessingActive {
+                self.teardownOnQueue()
+                do {
+                    _ = try self.startCaptureAndPlaybackOnQueue(
+                        voiceProcessingEnabled: false,
+                        downSourceFormat: downSourceFormat,
+                        upTargetFormat: upTargetFormat,
+                        chunkCallback: chunkCallback,
+                        rawBufferCallback: rawBufferCallback,
+                        onRMS: onRMS,
+                        onEvent: onEvent
+                    )
+                    onEvent(.fellBackToStandardCapture)
+                } catch {
+                    onEvent(.failed(error.localizedDescription))
+                }
+            } else {
+                self.teardownOnQueue()
+                onEvent(.failed("Microphone audio input did not start (no audio buffers received from hardware)."))
+            }
+        }
+
+        return voiceProcessingActive
     }
 
     func startPlaybackOnlyIfNeeded(
@@ -593,6 +690,7 @@ private final class AudioGraphWorker: @unchecked Sendable {
     }
 
     private func teardownOnQueue() {
+        captureGeneration &+= 1
         playbackGeneration &+= 1
         if let engine {
             if isCapturing {

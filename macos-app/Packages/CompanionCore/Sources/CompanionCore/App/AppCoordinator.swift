@@ -13,12 +13,16 @@ public final class AppCoordinator {
     public let webSocketClient: SidecarWebSocketClient
     public let audioManager: AudioEngineManager
     public let speechManager: SpeechRecognitionManager
+    public let offlineSpeechManager: OfflineSpeechManager
+    public let offlineEngine: any OfflineQASession
     public let hotkeyManager: GlobalHotkeyManager
     public let overlayController: OverlayWindowController
 
+    public var backendMode: AssistantBackendMode = .auto
     public private(set) var isSessionActive: Bool = false
     public private(set) var lastStatusError: String?
     @ObservationIgnored private var lastSurfacedSpeechError: String?
+    @ObservationIgnored private var lastSurfacedAudioError: String?
     @ObservationIgnored private var lastAppliedDictationText: String = ""
     @ObservationIgnored private var isStreamingAssistantTurn: Bool = false
 
@@ -27,7 +31,9 @@ public final class AppCoordinator {
         overlayStore: OverlayStateStore? = nil,
         permissionsManager: PermissionsManager? = nil,
         hotkeyMode: HotkeyActivationMode = .smartTapOrHold,
-        speechManager: SpeechRecognitionManager? = nil
+        speechManager: SpeechRecognitionManager? = nil,
+        offlineSpeechManager: OfflineSpeechManager? = nil,
+        offlineEngine: (any OfflineQASession)? = nil
     ) {
         let store = overlayStore ?? OverlayStateStore()
         let permissions = permissionsManager ?? PermissionsManager()
@@ -36,6 +42,8 @@ public final class AppCoordinator {
         let ws = SidecarWebSocketClient(url: sidecarURL, overlayStore: store)
         let audio = AudioEngineManager()
         let speech = speechManager ?? SpeechRecognitionManager()
+        let offlineSpeech = offlineSpeechManager ?? OfflineSpeechManager()
+        let offline = offlineEngine ?? OfflineAssistantEngine()
         let hotkey = GlobalHotkeyManager(mode: hotkeyMode)
         let overlay = OverlayWindowController(store: store)
 
@@ -46,6 +54,8 @@ public final class AppCoordinator {
         self.webSocketClient = ws
         self.audioManager = audio
         self.speechManager = speech
+        self.offlineSpeechManager = offlineSpeech
+        self.offlineEngine = offline
         self.hotkeyManager = hotkey
         self.overlayController = overlay
 
@@ -71,6 +81,8 @@ public final class AppCoordinator {
         guard !isSessionActive else { return }
         lastStatusError = nil
         lastSurfacedSpeechError = nil
+        lastSurfacedAudioError = nil
+        offlineSpeechManager.stopImmediately()
         permissionsManager.refresh()
 
         isSessionActive = true
@@ -87,17 +99,31 @@ public final class AppCoordinator {
 
         webSocketClient.connect()
 
-        do {
-            try audioManager.start()
-        } catch {
-            lastStatusError = "Audio start failed: \(error.localizedDescription)"
-        }
-
-        Task { @MainActor [weak self] in
-            guard let self, self.isSessionActive else { return }
-            await self.speechManager.start()
-            guard self.isSessionActive, let speechError = self.speechManager.lastError else { return }
-            self.surfaceSpeechErrorOnce(speechError)
+        switch permissionsManager.microphone {
+        case .granted:
+            startAudioCapture()
+            Task { @MainActor [weak self] in
+                guard let self, self.isSessionActive else { return }
+                await self.speechManager.start()
+                guard self.isSessionActive, let speechError = self.speechManager.lastError else { return }
+                self.surfaceSpeechErrorOnce(speechError)
+            }
+        case .notDetermined:
+            Task { @MainActor [weak self] in
+                guard let self, self.isSessionActive else { return }
+                await self.permissionsManager.requestMicrophone()
+                guard self.isSessionActive else { return }
+                guard self.permissionsManager.microphone == .granted else {
+                    self.surfaceAudioErrorOnce("Microphone permission denied in System Settings > Privacy & Security.")
+                    return
+                }
+                self.startAudioCapture()
+                await self.speechManager.start()
+                guard self.isSessionActive, let speechError = self.speechManager.lastError else { return }
+                self.surfaceSpeechErrorOnce(speechError)
+            }
+        case .denied:
+            surfaceAudioErrorOnce("Microphone permission denied in System Settings > Privacy & Security.")
         }
 
         captureEngine.startSessionCapture(interval: 1.0) { [weak self] contextMessage in
@@ -106,6 +132,14 @@ public final class AppCoordinator {
 
         Task { @MainActor [weak self] in
             await self?.sendStartControlWhenReady()
+        }
+    }
+
+    private func startAudioCapture() {
+        do {
+            try audioManager.start()
+        } catch {
+            surfaceAudioErrorOnce("Audio start failed: \(error.localizedDescription)")
         }
     }
 
@@ -119,6 +153,7 @@ public final class AppCoordinator {
         hotkeyManager.syncSessionActive(false)
         captureEngine.stopSessionCapture()
         speechManager.stop()
+        offlineSpeechManager.stopImmediately()
         audioManager.stop()
         privacyFilter.stopObserving()
 
@@ -142,6 +177,13 @@ public final class AppCoordinator {
         isStreamingAssistantTurn = false
         overlayStore.appendChatMessage(isUser: true, text: trimmed)
 
+        if backendMode == .offlineOnly {
+            Task { @MainActor [weak self] in
+                await self?.runOfflineFallback(for: trimmed)
+            }
+            return
+        }
+
         if webSocketClient.connectionState != .connected {
             webSocketClient.connect()
         }
@@ -155,12 +197,14 @@ public final class AppCoordinator {
     public func setOutputMuted(_ muted: Bool) {
         audioManager.setOutputMuted(muted)
         if muted {
+            offlineSpeechManager.stopImmediately()
             triggerManualBargeIn()
         }
     }
 
     /// Immediately stops playback and fades annotations, notifying the sidecar of manual barge-in.
     public func triggerManualBargeIn() {
+        offlineSpeechManager.stopImmediately()
         audioManager.stopPlaybackImmediately()
         overlayStore.handleBargeIn(BargeInMessage(reason: .manual))
 
@@ -221,6 +265,11 @@ public final class AppCoordinator {
             self.applyLiveDictationTranscript(transcript)
         }
 
+        speechManager.onError = { [weak self] message in
+            guard let self, self.isSessionActive else { return }
+            self.surfaceSpeechErrorOnce(message)
+        }
+
         overlayStore.onHudStateApplied = { [weak self] message in
             self?.handleAppliedHudState(message)
         }
@@ -234,7 +283,7 @@ public final class AppCoordinator {
 
         audioManager.onError = { [weak self] message in
             Task { @MainActor [weak self] in
-                self?.lastStatusError = "Audio start failed: \(message)"
+                self?.surfaceAudioErrorOnce("Audio start failed: \(message)")
             }
         }
 
@@ -274,6 +323,10 @@ public final class AppCoordinator {
                     try await webSocketClient.send(TextUpMessage(text: prompt))
                     return
                 } catch {
+                    if backendMode == .auto {
+                        await runOfflineFallback(for: prompt)
+                        return
+                    }
                     let notice = "Sidecar not connected at \(webSocketClient.url.absoluteString) — start Docker sidecar with 'docker compose up -d'."
                     lastStatusError = notice
                     overlayStore.appendChatMessage(isUser: false, text: notice)
@@ -283,9 +336,52 @@ public final class AppCoordinator {
             try? await Task.sleep(for: .milliseconds(100))
         }
 
+        if backendMode == .auto {
+            await runOfflineFallback(for: prompt)
+            return
+        }
+
         let notice = "Sidecar not connected at \(webSocketClient.url.absoluteString) — start Docker sidecar with 'docker compose up -d'."
         lastStatusError = notice
         overlayStore.appendChatMessage(isUser: false, text: notice)
+    }
+
+    /// Runs on-device Phase 5 fallback Q&A over redacted screen OCR + AX context and speaks the response locally.
+    public func runOfflineFallback(for prompt: String) async {
+        overlayStore.apply(HudStateMessage(state: .thinking, transcriptSnippet: "Thinking on-device…"))
+
+        let context: OfflineScreenContext
+        if !privacyFilter.isPaused,
+           let captured = try? await captureEngine.captureOfflineContext() {
+            overlayController.showOverlay()
+            overlayStore.triggerCapturePulse()
+            context = captured
+        } else {
+            let frontmost = NSWorkspace.shared.frontmostApplication
+            context = OfflineScreenContext(
+                sanitizedOCRText: "",
+                axElements: [],
+                frontmostBundleID: frontmost?.bundleIdentifier,
+                frontmostAppName: frontmost?.localizedName
+            )
+        }
+
+        do {
+            let reply = try await offlineEngine.answer(prompt: prompt, context: context)
+            let trimmed = reply.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            isStreamingAssistantTurn = false
+            overlayStore.appendChatMessage(isUser: false, text: trimmed)
+            overlayStore.apply(HudStateMessage(state: isSessionActive ? .listening : .idle, transcriptSnippet: trimmed))
+            if !isSessionActive {
+                offlineSpeechManager.speak(trimmed, muted: audioManager.isOutputMuted)
+            }
+        } catch {
+            let fallback = "Offline assistant unavailable: \(error.localizedDescription)"
+            lastStatusError = fallback
+            overlayStore.appendChatMessage(isUser: false, text: fallback)
+            overlayStore.apply(HudStateMessage(state: .idle, transcriptSnippet: nil))
+        }
     }
 
     private func handleAppliedHudState(_ message: HudStateMessage) {
@@ -333,6 +429,14 @@ public final class AppCoordinator {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, lastSurfacedSpeechError != trimmed else { return }
         lastSurfacedSpeechError = trimmed
+        lastStatusError = trimmed
+        overlayStore.appendChatMessage(isUser: false, text: trimmed)
+    }
+
+    private func surfaceAudioErrorOnce(_ message: String) {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, lastSurfacedAudioError != trimmed else { return }
+        lastSurfacedAudioError = trimmed
         lastStatusError = trimmed
         overlayStore.appendChatMessage(isUser: false, text: trimmed)
     }

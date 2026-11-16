@@ -52,12 +52,37 @@ def build_live_config() -> types.LiveConnectConfig:
 
 def summarize_ax_elements(ctx: ScreenContextMessage, limit: int = 30) -> str:
     """Create a compact text summary of visible AXUIElements for Gemini context."""
-    if not ctx.ax_elements:
+    detected_rects = getattr(ctx, "detected_rects", None) or []
+    if not ctx.ax_elements and not detected_rects:
         return ""
     lines = [f"Frontmost app: {ctx.frontmost_bundle_id or 'unknown'} ({ctx.screen_width}x{ctx.screen_height})"]
-    for ax in ctx.ax_elements[:limit]:
-        label = ax.title or ax.description or ax.value or ""
-        lines.append(f"- {ax.role}: {label!r} @ ({ax.x},{ax.y},{ax.width}x{ax.height})")
+    if ctx.ax_elements:
+        for ax in ctx.ax_elements[:limit]:
+            label = ax.title or ax.description or ax.value or ""
+            lines.append(f"- {ax.role}: {label!r} @ ({ax.x},{ax.y},{ax.width}x{ax.height})")
+    else:
+        lines.append(f"Vision-detected UI rectangles ({len(detected_rects)} total):")
+        for rect in detected_rects[:10]:
+            lines.append(f"- vision_rect @ ({rect.x},{rect.y},{rect.width}x{rect.height})")
+    return "\n".join(lines)
+
+
+def summarize_document_context(ctx: ScreenContextMessage) -> str:
+    """Create a compact text summary of on-screen document structure for Gemini context."""
+    doc = getattr(ctx, "document_context", None)
+    if doc is None:
+        return ""
+    lines: list[str] = []
+    if doc.title:
+        lines.append(f"Document title: {doc.title}")
+    for para in doc.paragraphs:
+        if para:
+            lines.append(f"- {para}")
+    for idx, table in enumerate(doc.tables, start=1):
+        if table.rows:
+            row_strs = [" | ".join(row) for row in table.rows if row]
+            if row_strs:
+                lines.append(f"Table {idx}: " + "; ".join(row_strs))
     return "\n".join(lines)
 
 
@@ -78,6 +103,8 @@ class GeminiLiveSessionManager:
         self._receive_task: asyncio.Task[None] | None = None
         self._latest_screen: ScreenContextMessage | None = None
         self._last_ax_summary: str = ""
+        self._last_doc_summary: str = ""
+        self._screen_sent_in_session: bool = False
 
     def _get_client(self) -> genai.Client:
         if self._client is None:
@@ -88,6 +115,9 @@ class GeminiLiveSessionManager:
         """Open the Gemini Live API session and start receiving server events."""
         if self._session is not None:
             return
+        self._last_ax_summary = ""
+        self._last_doc_summary = ""
+        self._screen_sent_in_session = False
         client = self._get_client()
         self._session_cm = client.aio.live.connect(model=self._model, config=build_live_config())
         self._session = await self._session_cm.__aenter__()
@@ -112,6 +142,9 @@ class GeminiLiveSessionManager:
         session_cm = self._session_cm
         self._session_cm = None
         self._session = None
+        self._last_ax_summary = ""
+        self._last_doc_summary = ""
+        self._screen_sent_in_session = False
         if session_cm is not None:
             try:
                 await session_cm.__aexit__(None, None, None)
@@ -138,6 +171,36 @@ class GeminiLiveSessionManager:
             if self._session is not None:
                 await self._session.send_realtime_input(**kwargs)
 
+    async def _forward_screen_context(
+        self,
+        message: ScreenContextMessage,
+        *,
+        allow_restart: bool = False,
+    ) -> None:
+        jpeg_bytes = base64.b64decode(message.jpeg_b64)
+        await self._send_realtime_with_reconnect(
+            allow_restart=allow_restart,
+            video=types.Blob(data=jpeg_bytes, mime_type="image/jpeg"),
+        )
+        if self._session is None:
+            return
+        summary = summarize_ax_elements(message)
+        if summary and summary != self._last_ax_summary and self._session is not None:
+            self._last_ax_summary = summary
+            await self._send_realtime_with_reconnect(
+                allow_restart=allow_restart,
+                text=f"[UI Context]\n{summary}",
+            )
+        doc_summary = summarize_document_context(message)
+        if doc_summary and doc_summary != self._last_doc_summary and self._session is not None:
+            self._last_doc_summary = doc_summary
+            await self._send_realtime_with_reconnect(
+                allow_restart=allow_restart,
+                text=f"[Document Context]\n{doc_summary}",
+            )
+        if self._session is not None:
+            self._screen_sent_in_session = True
+
     async def handle_upstream(self, message: UpstreamMessage) -> None:
         """Route an incoming macos-app message to the active Live session."""
         if isinstance(message, SessionControlMessage):
@@ -151,20 +214,9 @@ class GeminiLiveSessionManager:
 
         if isinstance(message, ScreenContextMessage):
             self._latest_screen = message
-            if self._session is None:
-                return
-            jpeg_bytes = base64.b64decode(message.jpeg_b64)
-            await self._send_realtime_with_reconnect(
-                allow_restart=False,
-                video=types.Blob(data=jpeg_bytes, mime_type="image/jpeg"),
-            )
-            summary = summarize_ax_elements(message)
-            if summary and summary != self._last_ax_summary and self._session is not None:
-                self._last_ax_summary = summary
-                await self._send_realtime_with_reconnect(
-                    allow_restart=False,
-                    text=f"[UI Context]\n{summary}",
-                )
+            self._screen_sent_in_session = False
+            if self._session is not None:
+                await self._forward_screen_context(message, allow_restart=False)
             return
 
         if isinstance(message, AudioUpMessage):
@@ -179,6 +231,10 @@ class GeminiLiveSessionManager:
 
         if isinstance(message, TextUpMessage):
             await self._emit(HudStateMessage(state="thinking"))
+            if self._session is None:
+                await self.start()
+            if self._latest_screen is not None and not self._screen_sent_in_session:
+                await self._forward_screen_context(self._latest_screen, allow_restart=True)
             await self._send_realtime_with_reconnect(
                 allow_restart=True,
                 text=message.text,

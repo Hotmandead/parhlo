@@ -33,6 +33,31 @@ class AXElementBounds(BaseModel):
     height: int = Field(ge=0)
 
 
+class DetectedRectBounds(BaseModel):
+    """Vision-detected UI rectangle fallback in top-left origin pixel coordinates."""
+
+    x: int
+    y: int
+    width: int = Field(ge=1)
+    height: int = Field(ge=1)
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+
+
+class DocumentTableSummary(BaseModel):
+    """Bounded structured table extracted from an on-screen document."""
+
+    rows: list[list[str]] = Field(default_factory=list, max_length=12)
+
+
+class DocumentContext(BaseModel):
+    """Redacted, bounded document structure extracted from on-screen content."""
+
+    title: str | None = Field(default=None, max_length=160)
+    paragraphs: list[str] = Field(default_factory=list, max_length=16)
+    tables: list[DocumentTableSummary] = Field(default_factory=list, max_length=2)
+    truncated: bool = False
+
+
 class SessionControlMessage(BaseModel):
     """Upstream session lifecycle control message from macos-app."""
 
@@ -50,6 +75,8 @@ class ScreenContextMessage(BaseModel):
     jpeg_b64: str
     ax_elements: list[AXElementBounds] = Field(default_factory=list)
     frontmost_bundle_id: str | None = None
+    detected_rects: list[DetectedRectBounds] = Field(default_factory=list)
+    document_context: DocumentContext | None = None
 
 
 class AudioUpMessage(BaseModel):

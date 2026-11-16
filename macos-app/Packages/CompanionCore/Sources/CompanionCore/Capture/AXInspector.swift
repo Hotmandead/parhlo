@@ -70,6 +70,25 @@ public actor AXInspector {
         return results
     }
 
+    nonisolated private static let containerRoles: Set<String> = [
+        "AXApplication",
+        "AXWindow",
+        "AXScrollArea",
+        "AXWebArea",
+        "AXGroup",
+    ]
+
+    /// Returns `true` when the Accessibility tree is empty or has fewer than 4 non-container elements.
+    nonisolated public static func isSparseTree(_ elements: [AXElementBounds]) -> Bool {
+        guard !elements.isEmpty else { return true }
+        let nonContainerCount = elements.reduce(into: 0) { count, element in
+            if !Self.containerRoles.contains(element.role) {
+                count += 1
+            }
+        }
+        return nonContainerCount < 4
+    }
+
     /// Filters out zero-sized or off-screen elements relative to `screenBounds`.
     nonisolated public static func isVisibleFrame(_ rect: CGRect, within screenBounds: CGRect?) -> Bool {
         guard rect.width > 0, rect.height > 0,
