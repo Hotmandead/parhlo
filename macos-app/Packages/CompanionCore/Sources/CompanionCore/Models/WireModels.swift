@@ -129,11 +129,29 @@ public struct AudioUpMessage: Codable, Sendable, Equatable {
     }
 }
 
+/// Upstream typed or dictated text prompt matching `schemas.TextUpMessage`.
+public struct TextUpMessage: Codable, Sendable, Equatable {
+    public let type: String
+    public let text: String
+
+    public init(type: String = "text_up", text: String) {
+        self.type = type
+        self.text = text
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.type = try container.decodeIfPresent(String.self, forKey: .type) ?? "text_up"
+        self.text = try container.decode(String.self, forKey: .text)
+    }
+}
+
 /// Discriminated union of all upstream messages sent from `macos-app` to `agent-sidecar`.
 public enum UpstreamMessage: Codable, Sendable, Equatable {
     case sessionControl(SessionControlMessage)
     case screenContext(ScreenContextMessage)
     case audioUp(AudioUpMessage)
+    case textUp(TextUpMessage)
 
     private enum CodingKeys: String, CodingKey {
         case type
@@ -149,6 +167,8 @@ public enum UpstreamMessage: Codable, Sendable, Equatable {
             self = .screenContext(try ScreenContextMessage(from: decoder))
         case "audio_up":
             self = .audioUp(try AudioUpMessage(from: decoder))
+        case "text_up":
+            self = .textUp(try TextUpMessage(from: decoder))
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .type,
@@ -165,6 +185,8 @@ public enum UpstreamMessage: Codable, Sendable, Equatable {
         case .screenContext(let message):
             try message.encode(to: encoder)
         case .audioUp(let message):
+            try message.encode(to: encoder)
+        case .textUp(let message):
             try message.encode(to: encoder)
         }
     }

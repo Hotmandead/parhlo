@@ -23,6 +23,8 @@ public struct ChatMessage: Identifiable, Sendable, Equatable {
 public final class OverlayStateStore {
     public var hudState: HudState = .idle
     public var transcriptSnippet: String?
+    public var dictationText: String = ""
+    public var isEditingPrompt: Bool = false
     public var highlights: [DrawCommandMessage] = []
     public var arrows: [DrawCommandMessage] = []
     public var callouts: [DrawCommandMessage] = []
@@ -32,6 +34,7 @@ public final class OverlayStateStore {
             text: "Hold or tap Control+Option (⌃⌥) to speak, or ask a question below. Use the top-right gear for Settings & Permissions."
         )
     ]
+    @ObservationIgnored public var onHudStateApplied: (@MainActor (HudStateMessage) -> Void)?
     private var stateBeforePrivacyPause: HudState?
 
     public init() {}
@@ -69,7 +72,15 @@ public final class OverlayStateStore {
     /// Applies an incoming downstream `HudStateMessage` from `agent-sidecar`.
     public func apply(_ message: HudStateMessage) {
         hudState = message.state
-        transcriptSnippet = message.transcriptSnippet
+        if let rawSnippet = message.transcriptSnippet {
+            let trimmed = rawSnippet.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                transcriptSnippet = trimmed
+            }
+        } else {
+            transcriptSnippet = nil
+        }
+        onHudStateApplied?(message)
     }
 
     /// Removes all active visual annotations and resets HUD state to `.idle` when appropriate.

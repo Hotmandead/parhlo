@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Workspace
+   version = "1.0">
+   <FileRef
+      location = "group:macos-app/Parhlo.xcodeproj">
+   </FileRef>
+   <FileRef
+      location = "group:macos-app/Packages/CompanionCore">
+   </FileRef>
+   <Group
+      location = "container:"
+      name = "Documentation">
+      <FileRef
+         location = "group:README.md">
+      </FileRef>
+      <FileRef
+         location = "group:SETUP.md">
+      </FileRef>
+      <FileRef
+         location = "group:AGENTS.md">
+      </FileRef>
+      <FileRef
+         location = "group:implementation_plan.md">
+      </FileRef>
+   </Group>
+   <Group
+      location = "container:"
+      name = "Sidecar &amp; Docker">
+      <FileRef
+         location = "group:Dockerfile">
+      </FileRef>
+      <FileRef
+         location = "group:compose.yaml">
+      </FileRef>
+      <FileRef
+         location = "group:.env.example">
+      </FileRef>
+      <FileRef
+         location = "group:agent-sidecar">
+      </FileRef>
+   </Group>
+</Workspace>

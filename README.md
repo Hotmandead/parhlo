@@ -29,11 +29,11 @@ A native macOS screen-aware AI assistant optimized for Apple Silicon (`arm64-app
    ```
 3. **Test and run the native macOS app (`macos-app/`):**
    ```bash
-   cd macos-app
+   cd macos-app/Packages/CompanionCore
    swift build
    swift test
    ```
-   Then open `macos-app/Parhlo.xcodeproj` in Xcode and press **Run (`⌘R`)**.
+   Then open `Parhlo.xcworkspace` (at repo root) in Xcode and press **Run (`⌘R`)** or **Test (`⌘U`)**.
 4. **Grant TCC Permissions & Speak:**
    - Click the Parhlo menu bar icon → **Settings & Permissions…** to grant **Screen Recording**, **Accessibility**, and **Microphone**.
    - Press **`Control+Option` (`⌃⌥`)** (tap to toggle, or hold to speak) over any macOS app—or choose **Start Voice Session (`⌃⌥`)** / **Demo Visual Annotations** from the menu bar.

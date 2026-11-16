@@ -53,6 +53,18 @@ public struct PermissionsOnboardingView: View {
                     },
                     onOpenSettings: { manager.openSystemSettings(for: .microphone) }
                 )
+
+                PermissionRow(
+                    title: "Speech Recognition",
+                    subtitle: "On-device speech-to-text populating the Ask Parhlo input bar.",
+                    status: manager.speechRecognition,
+                    onRequest: {
+                        Task {
+                            await manager.requestSpeechRecognition()
+                        }
+                    },
+                    onOpenSettings: { manager.openSystemSettings(for: .speechRecognition) }
+                )
             }
 
             HStack {

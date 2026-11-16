@@ -9,7 +9,7 @@ import websockets
 from websockets.asyncio.server import ServerConnection
 
 from sidecar.live_session import GeminiLiveSessionManager
-from sidecar.schemas import DownstreamMessage, UpstreamMessage
+from sidecar.schemas import DownstreamMessage, HudStateMessage, UpstreamMessage
 
 UPSTREAM_ADAPTER: TypeAdapter[UpstreamMessage] = TypeAdapter(UpstreamMessage)
 
@@ -25,7 +25,10 @@ async def handle_connection(websocket: ServerConnection) -> None:
     logger.info("Client connected from %s", websocket.remote_address)
 
     async def emit(message: DownstreamMessage) -> None:
-        await websocket.send(message.model_dump_json())
+        try:
+            await websocket.send(message.model_dump_json())
+        except websockets.exceptions.ConnectionClosed:
+            logger.debug("Skipping emit on closed WebSocket")
 
     manager = GeminiLiveSessionManager(emit=emit)
 
@@ -39,7 +42,11 @@ async def handle_connection(websocket: ServerConnection) -> None:
             except ValidationError as exc:
                 logger.warning("Invalid upstream payload: %s", exc)
                 continue
-            await manager.handle_upstream(parsed)
+            try:
+                await manager.handle_upstream(parsed)
+            except Exception as exc:
+                logger.exception("Error handling upstream message %s", parsed.type)
+                await emit(HudStateMessage(state="idle", transcript_snippet=f"Sidecar error: {exc}"))
     except websockets.exceptions.ConnectionClosed:
         logger.info("Client disconnected")
     finally:

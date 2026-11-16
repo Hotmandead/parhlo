@@ -157,6 +157,11 @@ public final class SidecarWebSocketClient {
         try await sendEncodable(message)
     }
 
+    /// Sends an upstream typed/dictated `TextUpMessage`.
+    public func send(_ message: TextUpMessage) async throws {
+        try await sendEncodable(message)
+    }
+
     /// Sends any `UpstreamMessage` variant as a JSON text frame.
     public func send(_ message: UpstreamMessage) async throws {
         try await sendEncodable(message)

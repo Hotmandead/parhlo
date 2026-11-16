@@ -17,6 +17,7 @@ from sidecar.schemas import (
     HudStateMessage,
     ScreenContextMessage,
     SessionControlMessage,
+    TextUpMessage,
     UpstreamMessage,
 )
 from sidecar.tool_dispatcher import resolve_tool_call
@@ -142,6 +143,15 @@ class GeminiLiveSessionManager:
             await self._session.send_realtime_input(
                 audio=types.Blob(data=pcm_bytes, mime_type="audio/pcm;rate=16000")
             )
+            return
+
+        if isinstance(message, TextUpMessage):
+            if self._session is None:
+                await self.start()
+            if self._session is None:
+                return
+            await self._emit(HudStateMessage(state="thinking"))
+            await self._session.send_realtime_input(text=message.text)
 
     async def _receive_loop(self) -> None:
         assert self._session is not None

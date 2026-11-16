@@ -27,6 +27,7 @@ public final class AudioEngineManager {
     @ObservationIgnored public var localVADEnabled: Bool = true
 
     @ObservationIgnored public var onAudioChunk: (@Sendable (Data) -> Void)?
+    @ObservationIgnored public var onRawAudioBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
     @ObservationIgnored public var onLocalVoiceActivity: (@Sendable () -> Void)?
 
     @ObservationIgnored private var engine: AVAudioEngine?
@@ -83,11 +84,14 @@ public final class AudioEngineManager {
         }
 
         let chunkCallback = onAudioChunk
+        let rawBufferCallback = onRawAudioBuffer
         let vadThreshold = localVADThreshold
         let vadEnabled = localVADEnabled
 
         inputNode.removeTap(onBus: 0)
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: hardwareInputFormat) { [weak self] buffer, _ in
+            rawBufferCallback?(buffer)
+
             guard let pcmData = Self.convertToPCMInt16Data(
                 buffer: buffer,
                 converter: upConverter,

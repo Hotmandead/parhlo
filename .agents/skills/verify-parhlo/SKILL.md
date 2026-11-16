@@ -8,6 +8,8 @@ description: >-
 
 # Verify Parhlo
 
+**Concurrency Rule:** Always spawn a background subagent (`invoke_subagent`) to run the Swift unit tests (`swift test`) and Docker sidecar tests (`docker compose run --rm sidecar pytest -v`) in parallel so `xcodebuild` and `Parhlo.app` launch can proceed immediately for manual user testing without waiting on test suites.
+
 Run the checks matching the components modified.
 
 ## 1. Python Sidecar (Docker)
@@ -26,15 +28,16 @@ Expected: all tests in `agent-sidecar/tests/` pass with exit code `0`.
 Ensure `xcode-select -p` points to `/Applications/Xcode.app/Contents/Developer`, then build and test:
 
 ```bash
-cd macos-app
+cd macos-app/Packages/CompanionCore
 swift build
 swift test
 ```
 
-If verifying the `.app` bundle via Xcode CLI:
+If verifying the `.app` bundle and tests via Xcode CLI:
 
 ```bash
-xcodebuild -project macos-app/Parhlo.xcodeproj -scheme Parhlo -configuration Debug build
+xcodebuild -workspace Parhlo.xcworkspace -scheme Parhlo -configuration Debug build
+xcodebuild -workspace Parhlo.xcworkspace -scheme Parhlo -configuration Debug test
 ```
 
 ## 3. End-to-End WebSocket Loopback Check

@@ -10,24 +10,29 @@ public enum AssistantDrawerTab: String, Sendable {
 /// Sleek dark notch-hugging pill that expands into a dotted-grid voice/chat assistant drawer.
 public struct NotchAssistantView: View {
     @Bindable private var coordinator: AppCoordinator
+    @Bindable private var overlayStore: OverlayStateStore
     @Binding private var isExpanded: Bool
     private let onOpenSettings: () -> Void
     private let onResizeNeeded: (Bool) -> Void
+    private let onRequestKeyFocus: () -> Void
 
     @State private var selectedTab: AssistantDrawerTab = .chat
-    @State private var draftPrompt: String = ""
     @State private var isMutedOutput: Bool = false
+    @FocusState private var isPromptFocused: Bool
 
     public init(
         coordinator: AppCoordinator,
         isExpanded: Binding<Bool>,
         onOpenSettings: @escaping () -> Void,
-        onResizeNeeded: @escaping (Bool) -> Void
+        onResizeNeeded: @escaping (Bool) -> Void,
+        onRequestKeyFocus: @escaping () -> Void = {}
     ) {
         self.coordinator = coordinator
+        self.overlayStore = coordinator.overlayStore
         self._isExpanded = isExpanded
         self.onOpenSettings = onOpenSettings
         self.onResizeNeeded = onResizeNeeded
+        self.onRequestKeyFocus = onRequestKeyFocus
     }
 
     public var body: some View {
@@ -39,6 +44,18 @@ public struct NotchAssistantView: View {
             }
         }
         .preferredColorScheme(.dark)
+        .onChange(of: isPromptFocused) { _, newValue in
+            coordinator.overlayStore.isEditingPrompt = newValue
+            if newValue {
+                onRequestKeyFocus()
+            }
+        }
+        .onChange(of: coordinator.overlayStore.dictationText) { _, newValue in
+            if !newValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               selectedTab != .chat {
+                selectedTab = .chat
+            }
+        }
     }
 
     // MARK: - Collapsed Camera-Notch Pill
@@ -64,7 +81,15 @@ public struct NotchAssistantView: View {
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(.white)
 
-                if coordinator.overlayStore.hudState != .idle {
+                if coordinator.overlayStore.hudState == .privacyPaused {
+                    Text("· Privacy Paused")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.red.opacity(0.9))
+                } else if isListeningStatus {
+                    Text("· Listening…")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.green.opacity(0.92))
+                } else if coordinator.overlayStore.hudState != .idle {
                     Text("· \(coordinator.overlayStore.hudState.displayTitle)")
                         .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(.white.opacity(0.72))
@@ -140,7 +165,7 @@ public struct NotchAssistantView: View {
                 Circle()
                     .fill(statusColor)
                     .frame(width: 7, height: 7)
-                Text(coordinator.overlayStore.hudState.displayTitle)
+                Text(drawerStatusTitle)
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.white.opacity(0.75))
             }
@@ -363,10 +388,19 @@ public struct NotchAssistantView: View {
                 .menuStyle(.borderlessButton)
                 .frame(width: 24)
 
-                TextField("Ask Parhlo…", text: $draftPrompt)
+                TextField(
+                    coordinator.isSessionActive ? "Listening… (Ask Parhlo…)" : "Ask Parhlo…",
+                    text: $overlayStore.dictationText
+                )
                     .textFieldStyle(.plain)
                     .font(.system(size: 13))
                     .foregroundStyle(.white)
+                    .focused($isPromptFocused)
+                    .simultaneousGesture(
+                        TapGesture().onEnded {
+                            onRequestKeyFocus()
+                        }
+                    )
                     .onSubmit { submitPrompt() }
 
                 Button {
@@ -392,7 +426,7 @@ public struct NotchAssistantView: View {
                         .foregroundStyle(.white)
                         .frame(width: 26, height: 26)
                         .background(
-                            draftPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            coordinator.overlayStore.dictationText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                                 ? Color.white.opacity(0.16)
                                 : Color.blue,
                             in: Circle()
@@ -411,18 +445,24 @@ public struct NotchAssistantView: View {
     }
 
     private func submitPrompt() {
-        let text = draftPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = coordinator.overlayStore.dictationText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
-        draftPrompt = ""
         selectedTab = .chat
-        coordinator.overlayStore.appendChatMessage(isUser: true, text: text)
+        coordinator.sendTextPrompt(text)
+    }
 
-        if !coordinator.isSessionActive {
-            coordinator.overlayStore.appendChatMessage(
-                isUser: false,
-                text: "Tap the mic or press Control+Option (⌃⌥) to stream screen + voice live to Gemini 3.8 Live, or click + → Demo Visual Annotations."
-            )
+    private var isListeningStatus: Bool {
+        coordinator.overlayStore.hudState == .listening
+            || (coordinator.isSessionActive && coordinator.overlayStore.hudState == .idle)
+            || (!coordinator.overlayStore.dictationText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && coordinator.overlayStore.hudState == .idle)
+    }
+
+    private var drawerStatusTitle: String {
+        if isListeningStatus {
+            return "Listening…"
         }
+        return coordinator.overlayStore.hudState.displayTitle
     }
 
     private var statusColor: Color {

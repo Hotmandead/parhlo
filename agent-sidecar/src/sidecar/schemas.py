@@ -59,8 +59,15 @@ class AudioUpMessage(BaseModel):
     pcm_b64: str
 
 
+class TextUpMessage(BaseModel):
+    """Upstream typed or dictated text prompt from the Assistant Drawer."""
+
+    type: Literal["text_up"] = "text_up"
+    text: str = Field(min_length=1)
+
+
 UpstreamMessage = Annotated[
-    SessionControlMessage | ScreenContextMessage | AudioUpMessage,
+    SessionControlMessage | ScreenContextMessage | AudioUpMessage | TextUpMessage,
     Field(discriminator="type"),
 ]
 

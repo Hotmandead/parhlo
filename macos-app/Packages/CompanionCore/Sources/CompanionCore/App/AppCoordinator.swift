@@ -6,23 +6,26 @@ import Observation
 @MainActor
 @Observable
 public final class AppCoordinator {
-    public let overlayStore: OverlayStateStore
+    public var overlayStore: OverlayStateStore
     public let permissionsManager: PermissionsManager
     public let privacyFilter: PrivacyFilter
     public let captureEngine: CaptureEngine
     public let webSocketClient: SidecarWebSocketClient
     public let audioManager: AudioEngineManager
+    public let speechManager: SpeechRecognitionManager
     public let hotkeyManager: GlobalHotkeyManager
     public let overlayController: OverlayWindowController
 
     public private(set) var isSessionActive: Bool = false
     public private(set) var lastStatusError: String?
+    @ObservationIgnored private var lastSurfacedSpeechError: String?
 
     public init(
         sidecarURL: URL = SidecarWebSocketClient.defaultURL,
         overlayStore: OverlayStateStore? = nil,
         permissionsManager: PermissionsManager? = nil,
-        hotkeyMode: HotkeyActivationMode = .smartTapOrHold
+        hotkeyMode: HotkeyActivationMode = .smartTapOrHold,
+        speechManager: SpeechRecognitionManager? = nil
     ) {
         let store = overlayStore ?? OverlayStateStore()
         let permissions = permissionsManager ?? PermissionsManager()
@@ -30,6 +33,7 @@ public final class AppCoordinator {
         let capture = CaptureEngine(privacyFilter: privacy)
         let ws = SidecarWebSocketClient(url: sidecarURL, overlayStore: store)
         let audio = AudioEngineManager()
+        let speech = speechManager ?? SpeechRecognitionManager()
         let hotkey = GlobalHotkeyManager(mode: hotkeyMode)
         let overlay = OverlayWindowController(store: store)
 
@@ -39,6 +43,7 @@ public final class AppCoordinator {
         self.captureEngine = capture
         self.webSocketClient = ws
         self.audioManager = audio
+        self.speechManager = speech
         self.hotkeyManager = hotkey
         self.overlayController = overlay
 
@@ -63,6 +68,7 @@ public final class AppCoordinator {
     public func startSession() {
         guard !isSessionActive else { return }
         lastStatusError = nil
+        lastSurfacedSpeechError = nil
         permissionsManager.refresh()
 
         isSessionActive = true
@@ -83,6 +89,13 @@ public final class AppCoordinator {
             lastStatusError = "Audio start failed: \(error.localizedDescription)"
         }
 
+        Task { @MainActor [weak self] in
+            guard let self, self.isSessionActive else { return }
+            await self.speechManager.start()
+            guard self.isSessionActive, let speechError = self.speechManager.lastError else { return }
+            self.surfaceSpeechErrorOnce(speechError)
+        }
+
         captureEngine.startSessionCapture(interval: 1.0) { [weak self] contextMessage in
             await self?.sendScreenContextIfConnected(contextMessage)
         }
@@ -99,6 +112,7 @@ public final class AppCoordinator {
         isSessionActive = false
         hotkeyManager.syncSessionActive(false)
         captureEngine.stopSessionCapture()
+        speechManager.stop()
         audioManager.stop()
         privacyFilter.stopObserving()
 
@@ -110,6 +124,23 @@ public final class AppCoordinator {
         overlayStore.clearAll()
         overlayStore.apply(HudStateMessage(state: .idle, transcriptSnippet: nil))
         overlayController.hideOverlay()
+    }
+
+    /// Sends a typed or dictated prompt from the `Ask Parhlo…` input bar over `TextUpMessage`.
+    public func sendTextPrompt(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        overlayStore.dictationText = ""
+        overlayStore.appendChatMessage(isUser: true, text: trimmed)
+
+        if webSocketClient.connectionState != .connected {
+            webSocketClient.connect()
+        }
+
+        Task { @MainActor [weak self] in
+            await self?.transmitTextPromptWhenReady(trimmed)
+        }
     }
 
     /// Immediately stops playback and fades annotations, notifying the sidecar of manual barge-in.
@@ -164,6 +195,21 @@ public final class AppCoordinator {
             }
         }
 
+        audioManager.onRawAudioBuffer = { [weak speech = self.speechManager] buffer in
+            speech?.appendAudioBuffer(buffer)
+        }
+
+        speechManager.onTranscriptUpdate = { [weak self] transcript, _ in
+            guard let self, self.isSessionActive else { return }
+            if !self.overlayStore.isEditingPrompt {
+                self.overlayStore.dictationText = transcript
+            }
+        }
+
+        overlayStore.onHudStateApplied = { [weak self] message in
+            self?.handleAppliedHudState(message)
+        }
+
         audioManager.onLocalVoiceActivity = { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self, self.isSessionActive else { return }
@@ -191,6 +237,59 @@ public final class AppCoordinator {
             }
             try? await Task.sleep(for: .milliseconds(100))
         }
+    }
+
+    private func transmitTextPromptWhenReady(_ prompt: String) async {
+        for _ in 0..<20 {
+            if webSocketClient.connectionState == .connected {
+                do {
+                    try await webSocketClient.send(TextUpMessage(text: prompt))
+                    return
+                } catch {
+                    let notice = "Sidecar not connected at \(webSocketClient.url.absoluteString) — start Docker sidecar with 'docker compose up -d'."
+                    lastStatusError = notice
+                    overlayStore.appendChatMessage(isUser: false, text: notice)
+                    return
+                }
+            }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+
+        let notice = "Sidecar not connected at \(webSocketClient.url.absoluteString) — start Docker sidecar with 'docker compose up -d'."
+        lastStatusError = notice
+        overlayStore.appendChatMessage(isUser: false, text: notice)
+    }
+
+    private func handleAppliedHudState(_ message: HudStateMessage) {
+        guard let rawSnippet = message.transcriptSnippet else { return }
+        let snippet = rawSnippet.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !snippet.isEmpty else { return }
+
+        if snippet == "Listening… (Control+Option to stop)"
+            || snippet == "Paused for protected app"
+            || snippet == "Privacy filter active"
+            || snippet.hasPrefix("Paused for ")
+            || snippet.hasPrefix("Demo:") {
+            return
+        }
+
+        let isAssistantTranscript = message.state == .listening || message.state == .drawing
+        let isSidecarError = message.state == .idle && snippet.hasPrefix("Sidecar error:")
+        guard isAssistantTranscript || isSidecarError else { return }
+
+        if let last = overlayStore.messages.last, !last.isUser, last.text == snippet {
+            return
+        }
+
+        overlayStore.appendChatMessage(isUser: false, text: snippet)
+    }
+
+    private func surfaceSpeechErrorOnce(_ message: String) {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, lastSurfacedSpeechError != trimmed else { return }
+        lastSurfacedSpeechError = trimmed
+        lastStatusError = trimmed
+        overlayStore.appendChatMessage(isUser: false, text: trimmed)
     }
 
     private func sendScreenContextIfConnected(_ message: ScreenContextMessage) async {

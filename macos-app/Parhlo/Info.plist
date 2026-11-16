@@ -26,6 +26,8 @@
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Parhlo uses your microphone for low-latency bidirectional voice conversation when activated with Control+Option.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Parhlo uses on-device speech recognition to transcribe your spoken questions into the Ask Parhlo input bar in real time.</string>
 	<key>NSScreenCaptureUsageDescription</key>
 	<string>Parhlo captures on-demand screen frames at up to 1 FPS and redacts sensitive text locally before explaining on-screen UI.</string>
 </dict>

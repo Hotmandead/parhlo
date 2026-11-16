@@ -2,7 +2,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "Parhlo",
+    name: "CompanionCore",
     platforms: [
         .macOS(.v14)
     ],
@@ -10,19 +10,11 @@ let package = Package(
         .library(
             name: "CompanionCore",
             targets: ["CompanionCore"]
-        ),
-        .executable(
-            name: "ScreenCompanionApp",
-            targets: ["ScreenCompanionApp"]
         )
     ],
     targets: [
         .target(
             name: "CompanionCore"
-        ),
-        .executableTarget(
-            name: "ScreenCompanionApp",
-            dependencies: ["CompanionCore"]
         ),
         .testTarget(
             name: "CompanionCoreTests",

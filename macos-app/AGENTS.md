@@ -2,7 +2,7 @@
 
 ## Environment & Build Tools
 - `macos-app/` runs natively on Apple Silicon (`arm64-apple-macosx`, `.macOS(.v14)`+) and must **not** be containerized—`ScreenCaptureKit`, `AXUIElement`, `Vision`, `NSWindow`, and `AVAudioEngine` require native WindowServer, TCC, and CoreAudio access.
-- Use Swift Package Manager (`Package.swift`) as the modular source of truth (`CompanionCore`, `ScreenCompanionApp`, `CompanionCoreTests`), wrapped by `Parhlo.xcodeproj` for `.app` signing, `Info.plist` TCC descriptions, and entitlements.
+- Use `Parhlo.xcworkspace` (at repo root) with the native `Parhlo/` app target (`ParhloApp.swift`, `Info.plist`, `Parhlo.entitlements` in `Parhlo.xcodeproj`) and the local Swift package `Packages/CompanionCore/` (`CompanionCore`, `CompanionCoreTests`).
 
 ## Swift 6 Concurrency & Architecture
 - Compile cleanly under **Swift 6 strict concurrency**.
@@ -20,5 +20,5 @@
 ## Quality Gate
 Before finishing any `macos-app/` change, run:
 ```bash
-cd macos-app && swift build && swift test
+cd macos-app/Packages/CompanionCore && swift build && swift test
 ```

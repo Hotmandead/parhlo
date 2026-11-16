@@ -46,8 +46,13 @@ docker compose up
 ## 4. Native macOS App Commands (After Phase 2–4 Scaffolding)
 
 ```bash
-cd macos-app
+cd macos-app/Packages/CompanionCore
 swift build
 swift test
-swift run ScreenCompanionApp
+```
+
+Or build & test the full `.app` bundle via the root Xcode workspace:
+```bash
+xcodebuild -workspace Parhlo.xcworkspace -scheme Parhlo -configuration Debug build
+xcodebuild -workspace Parhlo.xcworkspace -scheme Parhlo -configuration Debug test
 ```

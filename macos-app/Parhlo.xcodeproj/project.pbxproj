@@ -7,12 +7,12 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		A10000010000000000000001 /* ScreenCompanionApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000010000000000000001 /* ScreenCompanionApp.swift */; };
+		A10000010000000000000001 /* ParhloApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000010000000000000001 /* ParhloApp.swift */; };
 		A10000020000000000000002 /* CompanionCore in Frameworks */ = {isa = PBXBuildFile; productRef = A60000010000000000000001 /* CompanionCore */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		A20000010000000000000001 /* ScreenCompanionApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenCompanionApp.swift; sourceTree = "<group>"; };
+		A20000010000000000000001 /* ParhloApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ParhloApp.swift; sourceTree = "<group>"; };
 		A20000020000000000000002 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A20000030000000000000003 /* Parhlo.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Parhlo.entitlements; sourceTree = "<group>"; };
 		A20000040000000000000004 /* Parhlo.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Parhlo.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -33,35 +33,19 @@
 		A40000010000000000000001 = {
 			isa = PBXGroup;
 			children = (
-				A40000020000000000000002 /* Sources */,
-				A40000040000000000000004 /* AppConfig */,
+				A40000020000000000000002 /* Parhlo */,
 				A40000050000000000000005 /* Products */,
 			);
 			sourceTree = "<group>";
 		};
-		A40000020000000000000002 /* Sources */ = {
+		A40000020000000000000002 /* Parhlo */ = {
 			isa = PBXGroup;
 			children = (
-				A40000030000000000000003 /* ScreenCompanionApp */,
-			);
-			path = Sources;
-			sourceTree = "<group>";
-		};
-		A40000030000000000000003 /* ScreenCompanionApp */ = {
-			isa = PBXGroup;
-			children = (
-				A20000010000000000000001 /* ScreenCompanionApp.swift */,
-			);
-			path = ScreenCompanionApp;
-			sourceTree = "<group>";
-		};
-		A40000040000000000000004 /* AppConfig */ = {
-			isa = PBXGroup;
-			children = (
+				A20000010000000000000001 /* ParhloApp.swift */,
 				A20000020000000000000002 /* Info.plist */,
 				A20000030000000000000003 /* Parhlo.entitlements */,
 			);
-			path = AppConfig;
+			path = Parhlo;
 			sourceTree = "<group>";
 		};
 		A40000050000000000000005 /* Products */ = {
@@ -114,7 +98,7 @@
 			);
 			mainGroup = A40000010000000000000001;
 			packageReferences = (
-				A90000010000000000000001 /* XCLocalSwiftPackageReference "." */,
+				A90000010000000000000001 /* XCLocalSwiftPackageReference "Packages/CompanionCore" */,
 			);
 			productRefGroup = A40000050000000000000005 /* Products */;
 			projectDirPath = "";
@@ -130,7 +114,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				A10000010000000000000001 /* ScreenCompanionApp.swift in Sources */,
+				A10000010000000000000001 /* ParhloApp.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -174,12 +158,12 @@
 		AA0000030000000000000003 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CODE_SIGN_ENTITLEMENTS = AppConfig/Parhlo.entitlements;
+				CODE_SIGN_ENTITLEMENTS = Parhlo/Parhlo.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = AppConfig/Info.plist;
+				INFOPLIST_FILE = Parhlo/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
@@ -194,12 +178,12 @@
 		AA0000040000000000000004 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CODE_SIGN_ENTITLEMENTS = AppConfig/Parhlo.entitlements;
+				CODE_SIGN_ENTITLEMENTS = Parhlo/Parhlo.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = AppConfig/Info.plist;
+				INFOPLIST_FILE = Parhlo/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
@@ -235,16 +219,16 @@
 /* End XCConfigurationList section */
 
 /* Begin XCLocalSwiftPackageReference section */
-		A90000010000000000000001 /* XCLocalSwiftPackageReference "." */ = {
+		A90000010000000000000001 /* XCLocalSwiftPackageReference "Packages/CompanionCore" */ = {
 			isa = XCLocalSwiftPackageReference;
-			relativePath = .;
+			relativePath = Packages/CompanionCore;
 		};
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
 		A60000010000000000000001 /* CompanionCore */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = A90000010000000000000001 /* XCLocalSwiftPackageReference "." */;
+			package = A90000010000000000000001 /* XCLocalSwiftPackageReference "Packages/CompanionCore" */;
 			productName = CompanionCore;
 		};
 /* End XCSwiftPackageProductDependency section */

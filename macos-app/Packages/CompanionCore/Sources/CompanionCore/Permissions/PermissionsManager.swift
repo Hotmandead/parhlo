@@ -4,6 +4,7 @@ import ApplicationServices
 import CoreGraphics
 import Foundation
 import Observation
+import Speech
 
 /// Authorization status for macOS TCC permissions required by Parhlo.
 public enum PermissionStatus: String, Sendable, Equatable {
@@ -27,16 +28,20 @@ public final class PermissionsManager {
     public private(set) var screenRecording: PermissionStatus = .notDetermined
     public private(set) var accessibility: PermissionStatus = .notDetermined
     public private(set) var microphone: PermissionStatus = .notDetermined
+    public private(set) var speechRecognition: PermissionStatus = .notDetermined
 
     public var allGranted: Bool {
-        screenRecording == .granted && accessibility == .granted && microphone == .granted
+        screenRecording == .granted
+            && accessibility == .granted
+            && microphone == .granted
+            && speechRecognition == .granted
     }
 
     public init() {
         refresh()
     }
 
-    /// Re-reads current TCC status for Screen Recording, Accessibility, and Microphone.
+    /// Re-reads current TCC status for Screen Recording, Accessibility, Microphone, and Speech Recognition.
     public func refresh() {
         screenRecording = CGPreflightScreenCaptureAccess() ? .granted : .notDetermined
         accessibility = AXIsProcessTrusted() ? .granted : .notDetermined
@@ -51,6 +56,27 @@ public final class PermissionsManager {
         @unknown default:
             microphone = .notDetermined
         }
+
+        switch SFSpeechRecognizer.authorizationStatus() {
+        case .authorized:
+            speechRecognition = .granted
+        case .denied, .restricted:
+            speechRecognition = .denied
+        case .notDetermined:
+            speechRecognition = .notDetermined
+        @unknown default:
+            speechRecognition = .notDetermined
+        }
+    }
+
+    /// Requests Speech Recognition authorization for live voice-to-text transcription.
+    public func requestSpeechRecognition() async {
+        _ = await withCheckedContinuation { continuation in
+            SFSpeechRecognizer.requestAuthorization { status in
+                continuation.resume(returning: status)
+            }
+        }
+        refresh()
     }
 
     /// Prompts macOS Screen Recording permission dialog.
@@ -82,6 +108,7 @@ public final class PermissionsManager {
         case screenCapture
         case accessibility
         case microphone
+        case speechRecognition
 
         public var settingsURL: URL? {
             switch self {
@@ -91,6 +118,8 @@ public final class PermissionsManager {
                 URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
             case .microphone:
                 URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")
+            case .speechRecognition:
+                URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition")
             }
         }
     }

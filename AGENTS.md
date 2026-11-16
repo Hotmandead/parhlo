@@ -14,4 +14,4 @@ Parhlo is a two-process macOS screen-aware AI companion communicating over a loc
    - Default model: `gemini-3.8-live` (configurable via `GEMINI_LIVE_MODEL` in `.env`).
    - Global voice hotkey: `Control+Option` (`⌃⌥`) to speak to the macOS app, plus an `NSStatusItem` menu bar controller.
 4. **Secrets & Git Safety:** Never commit `.env`, API keys, or credentials. Keep `.gitignore` updated and use Conventional Commits (`feat:`, `fix:`, `refactor:`, `test:`, `chore:`).
-5. **Verification:** Use `.agents/skills/verify-parhlo/SKILL.md` for end-to-end validation commands.
+5. **Verification & Fast Manual Testing:** Always spawn a background subagent to run Swift unit tests (`cd macos-app/Packages/CompanionCore && swift test`) and Docker sidecar tests (`docker compose run --rm sidecar pytest -v`) so the main agent can immediately run `xcodebuild` / launch `Parhlo.app` for manual testing without blocking. See `.agents/skills/verify-parhlo/SKILL.md`.

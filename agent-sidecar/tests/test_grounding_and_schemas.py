@@ -70,6 +70,10 @@ def test_upstream_message_schema_parsing():
     assert msg.screen_width == 1512
     assert msg.scale_factor == 2.0
 
+    text_msg = adapter.validate_json('{"type":"text_up","text":"Where is the filter bar?"}')
+    assert text_msg.type == "text_up"
+    assert text_msg.text == "Where is the filter bar?"
+
 
 @pytest.mark.asyncio
 async def test_live_session_processes_tool_call_audio_and_barge_in():
