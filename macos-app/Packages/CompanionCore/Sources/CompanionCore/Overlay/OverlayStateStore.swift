@@ -25,6 +25,7 @@ public final class OverlayStateStore {
     public var transcriptSnippet: String?
     public var dictationText: String = ""
     public var isEditingPrompt: Bool = false
+    public var capturePulseID: Int = 0
     public var highlights: [DrawCommandMessage] = []
     public var arrows: [DrawCommandMessage] = []
     public var callouts: [DrawCommandMessage] = []
@@ -43,6 +44,33 @@ public final class OverlayStateStore {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         messages.append(ChatMessage(isUser: isUser, text: trimmed))
+    }
+
+    /// Appends a streaming assistant transcript delta onto the active assistant chat bubble.
+    public func appendToLastAssistantMessage(_ rawDelta: String) {
+        let trimmed = rawDelta.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        guard let lastIndex = messages.indices.last, !messages[lastIndex].isUser else {
+            messages.append(ChatMessage(isUser: false, text: trimmed))
+            return
+        }
+        let existing = messages[lastIndex].text
+        if existing == trimmed || existing.hasSuffix(trimmed) {
+            return
+        }
+        let separator = (rawDelta.first?.isWhitespace == true || existing.last?.isWhitespace == true) ? "" : " "
+        let combined = existing + separator + trimmed
+        messages[lastIndex] = ChatMessage(
+            id: messages[lastIndex].id,
+            isUser: false,
+            text: combined,
+            timestamp: messages[lastIndex].timestamp
+        )
+    }
+
+    /// Triggers a brief visual border pulse on the click-through overlay when a screen frame is captured.
+    public func triggerCapturePulse() {
+        capturePulseID &+= 1
     }
 
     public var hasAnnotations: Bool {

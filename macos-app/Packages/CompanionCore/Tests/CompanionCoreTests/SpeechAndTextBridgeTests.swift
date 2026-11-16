@@ -82,4 +82,33 @@ struct SpeechAndTextBridgeTests {
 
         coordinator.webSocketClient.disconnect()
     }
+
+    @Test("Live dictation updates focused empty/dictated prompt without clobbering manual text")
+    @MainActor
+    func liveDictationFocusAndOutputMuteBehavior() {
+        let store = OverlayStateStore()
+        let coordinator = AppCoordinator(
+            sidecarURL: URL(string: "ws://127.0.0.1:1")!,
+            overlayStore: store
+        )
+
+        store.isEditingPrompt = true
+        coordinator.applyLiveDictationTranscript("What is on my screen")
+        #expect(store.dictationText == "What is on my screen")
+
+        coordinator.applyLiveDictationTranscript("What is on my screen right now")
+        #expect(store.dictationText == "What is on my screen right now")
+
+        // Manual edit while focused should not be overwritten by subsequent speech updates.
+        store.dictationText = "Typed manually"
+        coordinator.applyLiveDictationTranscript("Ignored dictation")
+        #expect(store.dictationText == "Typed manually")
+
+        coordinator.setOutputMuted(true)
+        #expect(coordinator.audioManager.isOutputMuted == true)
+        coordinator.setOutputMuted(false)
+        #expect(coordinator.audioManager.isOutputMuted == false)
+
+        coordinator.webSocketClient.disconnect()
+    }
 }

@@ -1,7 +1,22 @@
 @preconcurrency import AVFoundation
 import Foundation
 import Observation
+import os
 @preconcurrency import Speech
+
+/// Thread-safe holder allowing audio tap threads to append `AVAudioPCMBuffer`s synchronously.
+private final class ActiveRecognitionRequestBox: @unchecked Sendable {
+    private let lock = OSAllocatedUnfairLock<SFSpeechAudioBufferRecognitionRequest?>(initialState: nil)
+
+    func set(_ request: SFSpeechAudioBufferRecognitionRequest?) {
+        lock.withLock { $0 = request }
+    }
+
+    func append(_ buffer: AVAudioPCMBuffer) {
+        let request = lock.withLock { $0 }
+        request?.append(buffer)
+    }
+}
 
 /// Streams `AVAudioPCMBuffer` mic audio into Apple's `SFSpeechRecognizer` for live speech-to-text transcripts.
 @MainActor
@@ -14,6 +29,7 @@ public final class SpeechRecognitionManager {
     @ObservationIgnored public var onTranscriptUpdate: (@MainActor (String, Bool) -> Void)?
 
     @ObservationIgnored private let recognizer: SFSpeechRecognizer?
+    @ObservationIgnored private let activeRequestBox = ActiveRecognitionRequestBox()
     @ObservationIgnored private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     @ObservationIgnored private var recognitionTask: SFSpeechRecognitionTask?
 
@@ -31,11 +47,7 @@ public final class SpeechRecognitionManager {
             lastError = "Speech Recognition permission denied in System Settings."
             return false
         }
-        let status = await withCheckedContinuation { continuation in
-            SFSpeechRecognizer.requestAuthorization { result in
-                continuation.resume(returning: result)
-            }
-        }
+        let status = await Self.requestAuthorizationStatus()
         if status != .authorized {
             lastError = "Speech Recognition permission not granted."
         }
@@ -60,42 +72,64 @@ public final class SpeechRecognitionManager {
             request.requiresOnDeviceRecognition = true
         }
         self.recognitionRequest = request
+        self.activeRequestBox.set(request)
         self.isListening = true
 
-        self.recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
-            let transcript = result?.bestTranscription.formattedString
-            let isFinal = result?.isFinal ?? false
-            let errorMessage = error?.localizedDescription
-
+        self.recognitionTask = Self.startRecognitionTask(
+            recognizer: recognizer,
+            request: request
+        ) { [weak self] transcript, isFinal, errorMessage, hasError in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 if let transcript, !transcript.isEmpty {
                     self.latestTranscript = transcript
                     self.onTranscriptUpdate?(transcript, isFinal)
                 }
-                if let errorMessage, error != nil {
+                if let errorMessage, hasError {
                     self.lastError = errorMessage
                 }
-                if isFinal || error != nil {
+                if isFinal || hasError {
+                    self.activeRequestBox.set(nil)
                     self.isListening = false
                 }
             }
         }
     }
 
-    /// Appends a live audio buffer from `AVAudioEngine`'s input tap into the active recognition request.
+    /// Appends a live audio buffer synchronously from `AVAudioEngine`'s tap thread before CoreAudio reuses it.
     nonisolated public func appendAudioBuffer(_ buffer: AVAudioPCMBuffer) {
-        Task { @MainActor [weak self] in
-            self?.recognitionRequest?.append(buffer)
-        }
+        activeRequestBox.append(buffer)
     }
 
     /// Ends audio input and cleans up the active recognition task.
     public func stop() {
+        activeRequestBox.set(nil)
         recognitionRequest?.endAudio()
         recognitionTask?.cancel()
         recognitionRequest = nil
         recognitionTask = nil
         isListening = false
+    }
+
+    // Keep Speech framework callbacks off @MainActor so Swift 6 does not assert main-queue execution.
+    nonisolated private static func requestAuthorizationStatus() async -> SFSpeechRecognizerAuthorizationStatus {
+        await withCheckedContinuation { continuation in
+            SFSpeechRecognizer.requestAuthorization { result in
+                continuation.resume(returning: result)
+            }
+        }
+    }
+
+    nonisolated private static func startRecognitionTask(
+        recognizer: SFSpeechRecognizer,
+        request: SFSpeechAudioBufferRecognitionRequest,
+        onEvent: @escaping @Sendable (String?, Bool, String?, Bool) -> Void
+    ) -> SFSpeechRecognitionTask {
+        recognizer.recognitionTask(with: request) { result, error in
+            let transcript = result?.bestTranscription.formattedString
+            let isFinal = result?.isFinal ?? false
+            let errorMessage = error?.localizedDescription
+            onEvent(transcript, isFinal, errorMessage, error != nil)
+        }
     }
 }

@@ -16,6 +16,7 @@ from sidecar.schemas import (
     DrawCommandMessage,
     PixelRect,
     ScreenContextMessage,
+    TextUpMessage,
     UpstreamMessage,
 )
 from sidecar.tools import get_overlay_tools
@@ -130,3 +131,55 @@ async def test_live_session_processes_tool_call_audio_and_barge_in():
     assert any(isinstance(m, AudioDownMessage) for m in emitted)
     assert len(sent_tool_responses) == 1
     assert sent_tool_responses[0].name == "highlight_region"
+
+
+@pytest.mark.asyncio
+async def test_text_up_reconnects_after_stale_session_disconnect():
+    emitted = []
+    sent_texts = []
+    connect_calls = 0
+
+    async def emit(msg):
+        emitted.append(msg)
+
+    class StaleSession:
+        async def send_realtime_input(self, **kwargs):
+            raise RuntimeError("1008 Session closed due to client inactivity.")
+
+        async def receive(self):
+            if False:
+                yield None
+
+    class FreshSession:
+        async def send_realtime_input(self, **kwargs):
+            sent_texts.append(kwargs.get("text"))
+
+        async def receive(self):
+            if False:
+                yield None
+
+    class FakeSessionCM:
+        def __init__(self, session):
+            self._session = session
+
+        async def __aenter__(self):
+            return self._session
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeLive:
+        def connect(self, model, config):
+            nonlocal connect_calls
+            connect_calls += 1
+            return FakeSessionCM(StaleSession() if connect_calls == 1 else FreshSession())
+
+    fake_client = SimpleNamespace(aio=SimpleNamespace(live=FakeLive()))
+    manager = GeminiLiveSessionManager(emit=emit, client=fake_client)
+
+    await manager.start()
+    await manager.handle_upstream(TextUpMessage(text="What's the weather?"))
+
+    assert connect_calls == 2
+    assert sent_texts == ["What's the weather?"]
+    await manager.stop()

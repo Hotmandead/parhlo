@@ -96,20 +96,47 @@ class GeminiLiveSessionManager:
 
     async def stop(self) -> None:
         """Close the Gemini Live API session and cancel background tasks."""
-        if self._receive_task is not None:
-            self._receive_task.cancel()
+        receive_task = self._receive_task
+        self._receive_task = None
+        if receive_task is not None and receive_task is not asyncio.current_task():
+            receive_task.cancel()
             try:
-                await self._receive_task
+                await receive_task
             except asyncio.CancelledError:
                 pass
-            self._receive_task = None
 
-        if self._session_cm is not None:
-            await self._session_cm.__aexit__(None, None, None)
-            self._session_cm = None
-            self._session = None
-
+        await self._close_session_cm()
         await self._emit(HudStateMessage(state="idle"))
+
+    async def _close_session_cm(self) -> None:
+        session_cm = self._session_cm
+        self._session_cm = None
+        self._session = None
+        if session_cm is not None:
+            try:
+                await session_cm.__aexit__(None, None, None)
+            except Exception:
+                logger.debug("Ignoring error while closing stale Live session", exc_info=True)
+
+    async def _send_realtime_with_reconnect(self, *, allow_restart: bool, **kwargs) -> None:
+        if self._session is None:
+            if not allow_restart:
+                return
+            await self.start()
+        if self._session is None:
+            return
+        try:
+            await self._session.send_realtime_input(**kwargs)
+        except Exception as exc:
+            if not allow_restart:
+                logger.debug("Live session send failed (%s); resetting stale session", exc)
+                await self._close_session_cm()
+                return
+            logger.warning("Live session send failed (%s); reconnecting and retrying", exc)
+            await self._close_session_cm()
+            await self.start()
+            if self._session is not None:
+                await self._session.send_realtime_input(**kwargs)
 
     async def handle_upstream(self, message: UpstreamMessage) -> None:
         """Route an incoming macos-app message to the active Live session."""
@@ -127,42 +154,52 @@ class GeminiLiveSessionManager:
             if self._session is None:
                 return
             jpeg_bytes = base64.b64decode(message.jpeg_b64)
-            await self._session.send_realtime_input(
-                video=types.Blob(data=jpeg_bytes, mime_type="image/jpeg")
+            await self._send_realtime_with_reconnect(
+                allow_restart=False,
+                video=types.Blob(data=jpeg_bytes, mime_type="image/jpeg"),
             )
             summary = summarize_ax_elements(message)
-            if summary and summary != self._last_ax_summary:
+            if summary and summary != self._last_ax_summary and self._session is not None:
                 self._last_ax_summary = summary
-                await self._session.send_realtime_input(text=f"[UI Context]\n{summary}")
+                await self._send_realtime_with_reconnect(
+                    allow_restart=False,
+                    text=f"[UI Context]\n{summary}",
+                )
             return
 
         if isinstance(message, AudioUpMessage):
             if self._session is None:
                 return
             pcm_bytes = base64.b64decode(message.pcm_b64)
-            await self._session.send_realtime_input(
-                audio=types.Blob(data=pcm_bytes, mime_type="audio/pcm;rate=16000")
+            await self._send_realtime_with_reconnect(
+                allow_restart=False,
+                audio=types.Blob(data=pcm_bytes, mime_type="audio/pcm;rate=16000"),
             )
             return
 
         if isinstance(message, TextUpMessage):
-            if self._session is None:
-                await self.start()
-            if self._session is None:
-                return
             await self._emit(HudStateMessage(state="thinking"))
-            await self._session.send_realtime_input(text=message.text)
+            await self._send_realtime_with_reconnect(
+                allow_restart=True,
+                text=message.text,
+            )
 
     async def _receive_loop(self) -> None:
-        assert self._session is not None
+        session = self._session
+        assert session is not None
         try:
-            async for response in self._session.receive():
+            async for response in session.receive():
                 await self.process_live_response(response)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("Error in Gemini Live receive loop")
             await self._emit(HudStateMessage(state="idle", transcript_snippet="Live session disconnected"))
+        finally:
+            if self._session is session:
+                await self._close_session_cm()
+            if self._receive_task is asyncio.current_task():
+                self._receive_task = None
 
     async def process_live_response(self, response) -> None:
         """Process tool calls and server content from a Gemini Live API event."""

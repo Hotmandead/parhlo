@@ -71,12 +71,16 @@ public final class PermissionsManager {
 
     /// Requests Speech Recognition authorization for live voice-to-text transcription.
     public func requestSpeechRecognition() async {
-        _ = await withCheckedContinuation { continuation in
+        _ = await Self.requestSpeechAuthorizationStatus()
+        refresh()
+    }
+
+    nonisolated private static func requestSpeechAuthorizationStatus() async -> SFSpeechRecognizerAuthorizationStatus {
+        await withCheckedContinuation { continuation in
             SFSpeechRecognizer.requestAuthorization { status in
                 continuation.resume(returning: status)
             }
         }
-        refresh()
     }
 
     /// Prompts macOS Screen Recording permission dialog.

@@ -17,7 +17,6 @@ public struct NotchAssistantView: View {
     private let onRequestKeyFocus: () -> Void
 
     @State private var selectedTab: AssistantDrawerTab = .chat
-    @State private var isMutedOutput: Bool = false
     @FocusState private var isPromptFocused: Bool
 
     public init(
@@ -404,12 +403,9 @@ public struct NotchAssistantView: View {
                     .onSubmit { submitPrompt() }
 
                 Button {
-                    isMutedOutput.toggle()
-                    if isMutedOutput {
-                        coordinator.triggerManualBargeIn()
-                    }
+                    coordinator.setOutputMuted(!coordinator.audioManager.isOutputMuted)
                 } label: {
-                    Image(systemName: isMutedOutput ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                    Image(systemName: coordinator.audioManager.isOutputMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(.white.opacity(0.7))
                         .frame(width: 26, height: 26)

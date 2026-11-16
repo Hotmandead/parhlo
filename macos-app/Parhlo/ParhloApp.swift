@@ -37,11 +37,78 @@ final class ParhloAppDelegate: NSObject, NSApplicationDelegate {
                 systemSymbolName: "sparkles.rectangle.stack",
                 accessibilityDescription: "Parhlo"
             )
-            button.toolTip = "Parhlo — Click to open Assistant Drawer (⌃⌥ to Speak)"
+            button.toolTip = "Parhlo — Click for Assistant Drawer, Right-Click for Voice & Menu (⌃⌥)"
             button.target = self
-            button.action = #selector(toggleAssistantDrawer)
+            button.action = #selector(handleStatusItemClick(_:))
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
         statusItem = item
+    }
+
+    @objc private func handleStatusItemClick(_ sender: NSStatusBarButton) {
+        if let event = NSApp.currentEvent, event.type == .rightMouseUp {
+            showStatusMenu(from: sender)
+        } else {
+            toggleAssistantDrawer()
+        }
+    }
+
+    private func showStatusMenu(from button: NSStatusBarButton) {
+        let menu = NSMenu()
+
+        let voiceTitle = coordinator.isSessionActive
+            ? "Stop Voice Session (⌃⌥)"
+            : "Start Voice Session (⌃⌥)"
+        let voiceItem = NSMenuItem(title: voiceTitle, action: #selector(toggleVoiceSession), keyEquivalent: "")
+        voiceItem.target = self
+        menu.addItem(voiceItem)
+
+        let drawerTitle = (notchPanelController?.isExpanded == true)
+            ? "Collapse Assistant Drawer"
+            : "Open Assistant Drawer"
+        let drawerItem = NSMenuItem(title: drawerTitle, action: #selector(toggleAssistantDrawer), keyEquivalent: "")
+        drawerItem.target = self
+        menu.addItem(drawerItem)
+
+        menu.addItem(.separator())
+
+        let demoItem = NSMenuItem(title: "Demo Visual Annotations", action: #selector(triggerDemoFromMenu), keyEquivalent: "")
+        demoItem.target = self
+        menu.addItem(demoItem)
+
+        let clearItem = NSMenuItem(title: "Clear Overlay", action: #selector(clearOverlayFromMenu), keyEquivalent: "")
+        clearItem.target = self
+        menu.addItem(clearItem)
+
+        let settingsItem = NSMenuItem(title: "Settings & Permissions…", action: #selector(openSettingsWindow), keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+
+        menu.addItem(.separator())
+
+        let quitItem = NSMenuItem(title: "Quit Parhlo", action: #selector(quitFromMenu), keyEquivalent: "q")
+        quitItem.target = self
+        menu.addItem(quitItem)
+
+        statusItem?.menu = menu
+        button.performClick(nil)
+        statusItem?.menu = nil
+    }
+
+    @objc private func toggleVoiceSession() {
+        coordinator.toggleSession()
+    }
+
+    @objc private func triggerDemoFromMenu() {
+        coordinator.triggerDemoAnnotations()
+    }
+
+    @objc private func clearOverlayFromMenu() {
+        coordinator.clearOverlay()
+    }
+
+    @objc private func quitFromMenu() {
+        quitApplication()
     }
 
     @objc private func toggleAssistantDrawer() {

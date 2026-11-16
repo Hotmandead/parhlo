@@ -1,8 +1,9 @@
 import SwiftUI
 
-/// Full-screen SwiftUI canvas combining Core Animation vectors, step callouts, and the HUD pill.
+/// Full-screen SwiftUI canvas combining Core Animation vectors, step callouts, and capture feedback.
 public struct OverlayCanvasView: View {
     @Bindable private var store: OverlayStateStore
+    @State private var captureBorderOpacity: Double = 0.0
 
     public init(store: OverlayStateStore) {
         self.store = store
@@ -17,12 +18,38 @@ public struct OverlayCanvasView: View {
                 )
                 .ignoresSafeArea()
 
+                // Subtle non-activating screen-edge shimmer showing on-demand capture occurred.
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .strokeBorder(
+                        LinearGradient(
+                            colors: [
+                                Color.cyan.opacity(0.85),
+                                Color.blue.opacity(0.75),
+                                Color.green.opacity(0.75)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        lineWidth: 3
+                    )
+                    .shadow(color: Color.cyan.opacity(0.55), radius: 12)
+                    .padding(6)
+                    .opacity(captureBorderOpacity)
+                    .allowsHitTesting(false)
+                    .ignoresSafeArea()
+
                 ForEach(store.callouts) { callout in
                     StepCalloutCardView(callout: callout, containerSize: geometry.size)
                 }
             }
             .frame(width: geometry.size.width, height: geometry.size.height)
             .animation(.easeOut(duration: 0.18), value: store.callouts.count)
+            .onChange(of: store.capturePulseID) { _, _ in
+                captureBorderOpacity = 0.9
+                withAnimation(.easeOut(duration: 0.55)) {
+                    captureBorderOpacity = 0.0
+                }
+            }
         }
         .background(Color.clear)
     }

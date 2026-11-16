@@ -19,6 +19,8 @@ public final class AppCoordinator {
     public private(set) var isSessionActive: Bool = false
     public private(set) var lastStatusError: String?
     @ObservationIgnored private var lastSurfacedSpeechError: String?
+    @ObservationIgnored private var lastAppliedDictationText: String = ""
+    @ObservationIgnored private var isStreamingAssistantTurn: Bool = false
 
     public init(
         sidecarURL: URL = SidecarWebSocketClient.defaultURL,
@@ -72,6 +74,8 @@ public final class AppCoordinator {
         permissionsManager.refresh()
 
         isSessionActive = true
+        lastAppliedDictationText = ""
+        isStreamingAssistantTurn = false
         hotkeyManager.syncSessionActive(true)
         privacyFilter.startObserving()
 
@@ -110,6 +114,8 @@ public final class AppCoordinator {
         guard isSessionActive else { return }
 
         isSessionActive = false
+        lastAppliedDictationText = ""
+        isStreamingAssistantTurn = false
         hotkeyManager.syncSessionActive(false)
         captureEngine.stopSessionCapture()
         speechManager.stop()
@@ -132,6 +138,8 @@ public final class AppCoordinator {
         guard !trimmed.isEmpty else { return }
 
         overlayStore.dictationText = ""
+        lastAppliedDictationText = ""
+        isStreamingAssistantTurn = false
         overlayStore.appendChatMessage(isUser: true, text: trimmed)
 
         if webSocketClient.connectionState != .connected {
@@ -140,6 +148,14 @@ public final class AppCoordinator {
 
         Task { @MainActor [weak self] in
             await self?.transmitTextPromptWhenReady(trimmed)
+        }
+    }
+
+    /// Mutes or unmutes assistant voice output, triggering manual barge-in when muted.
+    public func setOutputMuted(_ muted: Bool) {
+        audioManager.setOutputMuted(muted)
+        if muted {
+            triggerManualBargeIn()
         }
     }
 
@@ -179,6 +195,7 @@ public final class AppCoordinator {
 
         webSocketClient.onBargeIn = { [weak self] _ in
             Task { @MainActor [weak self] in
+                self?.isStreamingAssistantTurn = false
                 self?.audioManager.stopPlaybackImmediately()
             }
         }
@@ -201,9 +218,7 @@ public final class AppCoordinator {
 
         speechManager.onTranscriptUpdate = { [weak self] transcript, _ in
             guard let self, self.isSessionActive else { return }
-            if !self.overlayStore.isEditingPrompt {
-                self.overlayStore.dictationText = transcript
-            }
+            self.applyLiveDictationTranscript(transcript)
         }
 
         overlayStore.onHudStateApplied = { [weak self] message in
@@ -214,6 +229,12 @@ public final class AppCoordinator {
             Task { @MainActor [weak self] in
                 guard let self, self.isSessionActive else { return }
                 self.audioManager.stopPlaybackImmediately()
+            }
+        }
+
+        audioManager.onError = { [weak self] message in
+            Task { @MainActor [weak self] in
+                self?.lastStatusError = "Audio start failed: \(message)"
             }
         }
 
@@ -243,6 +264,13 @@ public final class AppCoordinator {
         for _ in 0..<20 {
             if webSocketClient.connectionState == .connected {
                 do {
+                    if !isSessionActive && !privacyFilter.isPaused {
+                        if let screenContext = try? await captureEngine.captureOnce(respectRateLimit: false) {
+                            overlayController.showOverlay()
+                            overlayStore.triggerCapturePulse()
+                            try? await webSocketClient.send(screenContext)
+                        }
+                    }
                     try await webSocketClient.send(TextUpMessage(text: prompt))
                     return
                 } catch {
@@ -277,11 +305,28 @@ public final class AppCoordinator {
         let isSidecarError = message.state == .idle && snippet.hasPrefix("Sidecar error:")
         guard isAssistantTranscript || isSidecarError else { return }
 
-        if let last = overlayStore.messages.last, !last.isUser, last.text == snippet {
-            return
+        if isAssistantTranscript {
+            if isStreamingAssistantTurn {
+                overlayStore.appendToLastAssistantMessage(rawSnippet)
+            } else {
+                isStreamingAssistantTurn = true
+                overlayStore.appendChatMessage(isUser: false, text: snippet)
+            }
+        } else {
+            isStreamingAssistantTurn = false
+            overlayStore.appendChatMessage(isUser: false, text: snippet)
         }
+    }
 
-        overlayStore.appendChatMessage(isUser: false, text: snippet)
+    /// Updates `dictationText` with live speech recognition while preserving non-dictation manual text.
+    public func applyLiveDictationTranscript(_ transcript: String) {
+        let current = overlayStore.dictationText
+        let canReplace = !overlayStore.isEditingPrompt
+            || current.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || current == lastAppliedDictationText
+        guard canReplace else { return }
+        overlayStore.dictationText = transcript
+        lastAppliedDictationText = transcript
     }
 
     private func surfaceSpeechErrorOnce(_ message: String) {
@@ -294,6 +339,7 @@ public final class AppCoordinator {
 
     private func sendScreenContextIfConnected(_ message: ScreenContextMessage) async {
         guard isSessionActive, webSocketClient.connectionState == .connected else { return }
+        overlayStore.triggerCapturePulse()
         try? await webSocketClient.send(message)
     }
 }
