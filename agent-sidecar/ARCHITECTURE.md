@@ -9,12 +9,12 @@
 | File | Responsibility | Key Symbols |
 | :--- | :--- | :--- |
 | [`src/sidecar/server.py`](src/sidecar/server.py) | `websockets` server entrypoint, JSON frame validation, per-connection lifecycle | `run_server`, `handle_connection`, `UPSTREAM_ADAPTER`, `main` |
-| [`src/sidecar/schemas.py`](src/sidecar/schemas.py) | Pydantic v2 wire contract (`UpstreamMessage` & `DownstreamMessage`) | `UpstreamMessage`, `DownstreamMessage`, `ScreenContextMessage`, `DrawCommandMessage`, `AXElementBounds` |
-| [`src/sidecar/live_session.py`](src/sidecar/live_session.py) | Bidirectional Gemini Live API session lifecycle, media streaming, VAD barge-in | `GeminiLiveSessionManager`, `build_live_config`, `summarize_ax_elements` |
+| [`src/sidecar/schemas.py`](src/sidecar/schemas.py) | Pydantic v2 wire contract (`UpstreamMessage` & `DownstreamMessage`) | `UpstreamMessage`, `DownstreamMessage`, `ScreenContextMessage`, `DrawCommandMessage`, `InputTranscriptMessage`, `AXElementBounds`, `DetectedRectBounds`, `DocumentContext` |
+| [`src/sidecar/live_session.py`](src/sidecar/live_session.py) | Bidirectional Gemini Live API session lifecycle, compression/resumption, media streaming, VAD barge-in | `GeminiLiveSessionManager`, `build_live_config`, `summarize_ax_elements`, `summarize_document_context` |
 | [`src/sidecar/tools.py`](src/sidecar/tools.py) | `NON_BLOCKING` Gemini `FunctionDeclaration` schemas for screen overlays | `get_overlay_tools`, `BOX_2D_SCHEMA` |
 | [`src/sidecar/tool_dispatcher.py`](src/sidecar/tool_dispatcher.py) | Converts Gemini `FunctionCall` payloads into `DrawCommandMessage` + `FunctionResponse` | `resolve_tool_call` |
-| [`src/sidecar/grounding.py`](src/sidecar/grounding.py) | `0–999` box denormalization and deterministic `AXUIElement` IoU/label snapping | `denormalize_box`, `rect_center`, `compute_iou`, `refine_with_ax_elements` |
-| [`tests/test_grounding_and_schemas.py`](tests/test_grounding_and_schemas.py) | Unit tests for denormalization, AX snapping, `NON_BLOCKING` tools, schemas, and session events | `test_live_session_processes_tool_call_audio_and_barge_in` |
+| [`src/sidecar/grounding.py`](src/sidecar/grounding.py) | `0–999` box denormalization and deterministic `AXUIElement` / Vision rect snapping | `denormalize_box`, `rect_center`, `compute_iou`, `refine_with_ax_elements`, `refine_with_detected_rects` |
+| [`tests/test_grounding_and_schemas.py`](tests/test_grounding_and_schemas.py) | Unit tests for denormalization, AX/Vision snapping, `NON_BLOCKING` tools, schemas, and Live session lifecycle | `test_live_session_processes_tool_call_audio_and_barge_in` |
 
 ---
 
@@ -31,33 +31,41 @@ sequenceDiagram
 
     Mac->>WS: UpstreamMessage JSON (type = "session_control", action = "start_session")
     WS->>Mgr: handle_upstream(SessionControlMessage)
-    Mgr->>Live: client.aio.live.connect(model, build_live_config())
+    Mgr->>Live: client.aio.live.connect(model, build_live_config(handle))
     Mgr-->>Mac: HudStateMessage(state="listening")
 
     par Continuous Multimodal Upstream
-        Mac->>WS: ScreenContextMessage (jpeg_b64, ax_elements, screen_width/height)
+        Mac->>WS: ScreenContextMessage (jpeg_b64, ax_elements, detected_rects, document_context)
         WS->>Mgr: handle_upstream(ScreenContextMessage)
-        Mgr->>Mgr: Cache _latest_screen
+        Mgr->>Mgr: Cache _latest_screen (no periodic text turns)
         Mgr->>Live: send_realtime_input(video=Blob(image/jpeg))
-        opt AX summary changed
-            Mgr->>Live: send_realtime_input(text="[UI Context]\n...")
-        end
     and
         Mac->>WS: AudioUpMessage (16 kHz Int16 PCM pcm_b64)
         WS->>Mgr: handle_upstream(AudioUpMessage)
         Mgr->>Live: send_realtime_input(audio=Blob("audio/pcm;rate=16000"))
+    and
+        Mac->>WS: TextUpMessage (text)
+        WS->>Mgr: handle_upstream(TextUpMessage)
+        opt Changed UI or Document context
+            Mgr->>Live: send_client_content(turns=[UI/Document Context], turn_complete=False)
+        end
+        Mgr->>Live: send_client_content(turns=[User text], turn_complete=True)
     end
 
+    Live-->>Mgr: session_resumption_update / go_away (proactive reconnect with handle)
     Live-->>Mgr: server_content.interrupted == True (VAD Barge-In)
     Mgr-->>Mac: BargeInMessage(reason="vad_interrupted")
 
     Live-->>Mgr: tool_call.function_calls (NON_BLOCKING)
     Mgr->>Disp: resolve_tool_call(call, _latest_screen)
     Disp->>Disp: denormalize_box(0-999 -> PixelRect)
-    Disp->>Disp: refine_with_ax_elements(IoU + label similarity + center bonus)
+    Disp->>Disp: refine_with_ax_elements / refine_with_detected_rects
     Disp-->>Mgr: (DrawCommandMessage, FunctionResponse)
     Mgr-->>Mac: DrawCommandMessage(pixel_rect, matched_ax_role, matched_ax_title)
     Mgr->>Live: send_tool_response(function_responses)
+
+    Live-->>Mgr: input_transcription / interim_input_transcription
+    Mgr-->>Mac: InputTranscriptMessage(text, is_final)
 
     Live-->>Mgr: server_content.model_turn.parts (24 kHz PCM) & output_transcription
     Mgr-->>Mac: AudioDownMessage(pcm_b64)
@@ -82,7 +90,7 @@ All coordinates on the wire use **top-left origin pixel coordinates** (`PixelRec
 
 **`UpstreamMessage`** (discriminated on `"type"`):
 1. `SessionControlMessage` (`"session_control"`): `action` in `{"start_session", "stop_session", "barge_in_manual"}`.
-2. `ScreenContextMessage` (`"screen_context"`): `screen_width` (`> 0`), `screen_height` (`> 0`), `scale_factor` (default `1.0`, `> 0`), `jpeg_b64`, `ax_elements: list[AXElementBounds]`, `frontmost_bundle_id: str | None`.
+2. `ScreenContextMessage` (`"screen_context"`): `screen_width` (`> 0`), `screen_height` (`> 0`), `scale_factor` (default `1.0`, `> 0`), `jpeg_b64`, `ax_elements: list[AXElementBounds]`, `frontmost_bundle_id: str | None`, `detected_rects: list[DetectedRectBounds]`, and `document_context: DocumentContext | None`.
 3. `AudioUpMessage` (`"audio_up"`): `pcm_b64` carrying 16 kHz, 16-bit, mono PCM microphone chunks.
 4. `TextUpMessage` (`"text_up"`): `text` (`min_length=1`) for typed or dictated prompts.
 
@@ -91,6 +99,7 @@ All coordinates on the wire use **top-left origin pixel coordinates** (`PixelRec
 2. `AudioDownMessage` (`"audio_down"`): `pcm_b64` carrying 24 kHz, 16-bit, mono PCM voice chunks from Gemini.
 3. `BargeInMessage` (`"barge_in"`): `reason` in `{"vad_interrupted", "manual"}` (default `"vad_interrupted"`).
 4. `HudStateMessage` (`"hud_state"`): `state` in `{"idle", "listening", "thinking", "drawing", "privacy_paused"}` and optional `transcript_snippet`.
+5. `InputTranscriptMessage` (`"input_transcript"`): `text` and `is_final` (`bool`, default `False`) carrying live user speech transcriptions from Gemini Live.
 
 ---
 
@@ -98,23 +107,29 @@ All coordinates on the wire use **top-left origin pixel coordinates** (`PixelRec
 
 - **Client & Model Configuration:**
   - `GeminiLiveSessionManager` defaults to `os.environ.get("GEMINI_LIVE_MODEL", "gemini-3.8-live")` and lazily instantiates `genai.Client(http_options={"api_version": "v1beta"})`.
-  - `build_live_config()` configures `types.LiveConnectConfig` with:
+  - `build_live_config(session_resumption_handle=None)` configures `types.LiveConnectConfig` with:
     - `response_modalities=[types.Modality.AUDIO]`
     - `input_audio_transcription=types.AudioTranscriptionConfig()` and `output_audio_transcription=types.AudioTranscriptionConfig()`
     - `tools=get_overlay_tools()`
-    - `system_instruction` instructing Parhlo to keep spoken explanations concise and invoke `highlight_region`, `point_arrow`, or `show_step_callout` with `0-999` `[ymin, xmin, ymax, xmax]` coordinates.
+    - `context_window_compression=types.ContextWindowCompressionConfig(sliding_window=types.SlidingWindow())` to extend audio+video sessions past the ~2-minute uncompressed limit.
+    - `session_resumption=types.SessionResumptionConfig(handle=session_resumption_handle)` to resume sessions across ~10-minute WebSocket connection resets using handles stored from `session_resumption_update` (and cleared on explicit `stop()`).
+    - `system_instruction` instructing Parhlo to keep spoken explanations concise, wait for explicit user input, and invoke `highlight_region`, `point_arrow`, or `show_step_callout` with `0-999` `[ymin, xmin, ymax, xmax]` coordinates.
+- **Concurrency & Lifecycle (`_session_lock`, `_receive_loop`):**
+  - `self._session_lock` (`asyncio.Lock`) serializes `start()`, `stop()`, `_close_session_cm()`, upstream forwarding, and reconnect paths so concurrent `ScreenContextMessage`, `AudioUpMessage`, and `TextUpMessage` frames cannot race or leak sessions.
+  - Because `google-genai`'s `AsyncSession.receive()` returns after each completed turn (`_is_interaction_complete`), `_receive_loop()` loops across consecutive `session.receive()` calls while `self._session is session and not self._stopping` so multi-turn voice/text sessions remain active.
 - **Upstream Routing (`handle_upstream`):**
   - `SessionControlMessage`:
-    - `start_session`: opens `client.aio.live.connect(...)`, launches `_receive_loop()` as an `asyncio.Task`, and emits `HudStateMessage(state="listening")`.
-    - `stop_session`: cancels `_receive_task`, exits `_session_cm`, and emits `HudStateMessage(state="idle")`.
-    - `barge_in_manual`: immediately emits `BargeInMessage(reason="manual")`.
-  - `ScreenContextMessage`: always updates `self._latest_screen` so tool resolution uses the newest frame and AX snapshot. When a Live session is open, decodes `jpeg_b64` and forwards `video=types.Blob(data=jpeg_bytes, mime_type="image/jpeg")`. It also builds a compact summary via `summarize_ax_elements(message, limit=30)` (frontmost bundle ID, screen dimensions, and up to 30 `role: label @ (x,y,widthxheight)` lines) and sends `text=f"[UI Context]\n{summary}"` only when the summary is non-empty and differs from `self._last_ax_summary`.
-  - `AudioUpMessage`: decodes `pcm_b64` and streams `audio=types.Blob(data=pcm_bytes, mime_type="audio/pcm;rate=16000")`.
-  - `TextUpMessage`: lazily starts the Live session if `_session is None`, emits `HudStateMessage(state="thinking")`, and forwards `text=message.text`.
-- **VAD Barge-In & Downstream Processing (`process_live_response`):**
-  - **Tool Calls:** If `response.tool_call` contains `function_calls`, `_handle_tool_calls` resolves each call synchronously, emits any resulting `DrawCommandMessage`, and returns all `types.FunctionResponse` items via `self._session.send_tool_response(...)`.
-  - **VAD Barge-In:** When `response.server_content.interrupted is True`, `GeminiLiveSessionManager` immediately emits `BargeInMessage(reason="vad_interrupted")` so the macOS client flushes queued `AVAudioPlayerNode` audio buffers and fades active overlays.
-  - **Voice Audio & Transcripts:** Iterates `server_content.model_turn.parts` for `inline_data.data` (base64-encoding raw `bytes` when needed) to emit `AudioDownMessage`, and forwards `server_content.output_transcription.text` as `HudStateMessage(state="listening", transcript_snippet=...)`.
+    - `start_session`: marks `_wants_active_session = True`, opens `client.aio.live.connect(...)`, launches `_receive_loop()`, and emits `HudStateMessage(state="listening")`.
+    - `stop_session`: cancels `_reconnect_task` and `_receive_task`, clears `_session_resumption_handle`, closes `_session_cm`, and emits `HudStateMessage(state="idle")`.
+    - `barge_in_manual`: resets `_has_active_drawings`, sets `_turn_idle_event`, emits `BargeInMessage(reason="manual")`, and sends `send_client_content(turn_complete=False)` when connected to interrupt active model generation.
+  - `ScreenContextMessage`: always updates `self._latest_screen` and resets `_screen_sent_in_session = False`. When a Live session is open (or `_wants_active_session` is active), forwards `video=types.Blob(data=jpeg_bytes, mime_type="image/jpeg")` via `send_realtime_input` without injecting periodic text turns.
+  - `AudioUpMessage`: decodes `pcm_b64` and streams `audio=types.Blob(data=pcm_bytes, mime_type="audio/pcm;rate=16000")` via `send_realtime_input`. On session start or audio reconnect, restores the cached screen JPEG (`include_text_context=False`) without injecting `client_content` text into the audio stream.
+  - `TextUpMessage`: lazily starts (or reconnects) the Live session, emits `HudStateMessage(state="thinking")`, forwards cached screen video if unsent, injects any changed `[UI Context]` (`summarize_ax_elements`) and `[Document Context]` (`summarize_document_context`) via `send_client_content(turns=types.Content(role="user", parts=...), turn_complete=False)`, and sends the user prompt with `turn_complete=True`.
+- **VAD Barge-In, Resumption & Downstream Processing (`process_live_response`):**
+  - **Session Resumption & `GoAway`:** Saves `session_resumption_update.new_handle` whenever `resumable` is true. On `go_away`, logs a warning and schedules `_proactive_reconnect(...)` (waiting briefly for any in-flight turn to finish via `_turn_idle_event`) to reconnect seamlessly with the stored handle when `_wants_active_session` is active.
+  - **Tool Calls & Cancellations:** Resolves `response.tool_call.function_calls`, emits any resulting `DrawCommandMessage`, tracks `_has_active_drawings`, and returns `types.FunctionResponse` items via `send_tool_response(...)`. Logs `tool_call_cancellation.ids` cleanly when the server cancels pending calls.
+  - **VAD Barge-In:** When `response.server_content.interrupted is True`, clears `_has_active_drawings`, sets `_turn_idle_event`, and emits `BargeInMessage(reason="vad_interrupted")`.
+  - **Voice Audio, Transcripts & `interaction_status`:** Processes all `model_turn.parts` (`inline_data` 24 kHz PCM -> `AudioDownMessage`; non-thought `text` fallback), maps `input_transcription` and `interim_input_transcription` to `InputTranscriptMessage`, emits `output_transcription` as `HudStateMessage`, and keeps HUD in `"thinking"` (or `"drawing"`) across intermediate `turn_complete=True` events while `interaction_status == IN_PROGRESS` until `interaction_status == IDLE` (or standard `turn_complete` / `generation_complete`).
 
 ---
 
@@ -159,8 +174,8 @@ All coordinates on the wire use **top-left origin pixel coordinates** (`PixelRec
 
 - **Base Image & Virtualenv ([`../Dockerfile`](../Dockerfile)):**
   - `base` stage pins `python:3.12-slim`, sets `PYTHONDONTWRITEBYTECODE=1` and `PYTHONUNBUFFERED=1`, and creates an isolated virtualenv at `VENV_PATH=/opt/venv`.
-  - `dev` stage installs editable package + dev extras (`pip install --no-cache-dir -e "/app/agent-sidecar[dev]"`) including `pytest>=8.3.0` and `pytest-asyncio>=0.24.0`, copies `tests/`, and launches `python -m sidecar.server`.
-  - `prod` stage installs only runtime dependencies (`google-genai>=3.2.0`, `pydantic>=2.9.0`, `websockets>=13.0`) without `tests/` or `dev` extras.
-- **Compose Service ([`../compose.yaml`](../compose.yaml)):**
-  - Service `sidecar` builds `target: dev`, publishes `"127.0.0.1:8765:8765"`, loads environment variables from `.env` (documented in [`.env.example`](../.env.example)), sets `SIDECAR_HOST=0.0.0.0` and `SIDECAR_PORT=8765`, bind-mounts `./agent-sidecar:/app/agent-sidecar` for live code edits, and isolates `/opt/venv` in the named volume `sidecar_venv`.
-  - Standard container workflows: `docker compose up --build` to run the WebSocket sidecar and `docker compose run --rm sidecar pytest -v` to execute the test suite inside Docker.
+  - `dev` stage installs editable package + dev extras (`pip install --no-cache-dir -e "/app/agent-sidecar[dev]"`) including `pytest>=8.3.0`, `pytest-asyncio>=0.24.0`, and `watchfiles>=1.0.0`, copies `tests/`, and defaults to `watchfiles --filter python "python -m sidecar.server" /app/agent-sidecar/src`.
+  - `prod` stage installs only runtime dependencies (`google-genai>=3.2.0`, `pydantic>=2.9.0`, `websockets>=13.0`) without `tests/` or `dev` extras and launches `python -m sidecar.server`.
+- **Compose Service & Live Reloading ([`../compose.yaml`](../compose.yaml)):**
+  - Service `sidecar` builds `target: dev`, publishes `"127.0.0.1:8765:8765"`, loads optional `.env` (`required: false`, documented in [`.env.example`](../.env.example)), sets `SIDECAR_HOST=0.0.0.0` and `SIDECAR_PORT=8765`, bind-mounts `./agent-sidecar:/app/agent-sidecar`, isolates `/opt/venv` in the named volume `sidecar_venv`, and runs `watchfiles --filter python "python -m sidecar.server" /app/agent-sidecar/src` so host Python edits reload automatically inside the container without rebuilding.
+  - Standard container workflows: `docker compose up --build` to run the auto-reloading WebSocket sidecar and `docker compose run --rm sidecar pytest -v` to execute the test suite inside Docker. (If upgrading an existing `sidecar_venv` volume created before `watchfiles` was added, refresh it once with `docker compose down -v && docker compose up --build`.)
