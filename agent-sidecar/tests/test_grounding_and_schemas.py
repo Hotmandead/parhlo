@@ -12,6 +12,7 @@ import pytest
 from sidecar.grounding import compute_iou, denormalize_box, refine_with_ax_elements
 from sidecar.live_session import (
     GeminiLiveSessionManager,
+    build_live_config,
     summarize_ax_elements,
     summarize_document_context,
 )
@@ -311,13 +312,17 @@ async def test_text_up_reconnects_with_screen_context_after_stale_session_discon
     await manager.handle_upstream(TextUpMessage(text="Where is Submit?"))
 
     assert connect_calls == 2
-    # Full screen + UI + Document context must be resent on the fresh Live session
-    assert len(fresh_realtime_inputs) == 3
+    # Fresh session resends video via realtime_input and UI/Document context with turn_complete=False
+    assert len(fresh_realtime_inputs) == 1
     assert fresh_realtime_inputs[0]["video"].data == b"screen-jpeg"
-    assert fresh_realtime_inputs[1]["text"].startswith("[UI Context]\n")
-    assert fresh_realtime_inputs[2]["text"].startswith("[Document Context]\n")
-    assert len(fresh_client_contents) == 1
-    turns, turn_complete = fresh_client_contents[0]
+    assert len(fresh_client_contents) == 2
+    ctx_turns, ctx_turn_complete = fresh_client_contents[0]
+    assert ctx_turn_complete is False
+    assert ctx_turns.role == "user"
+    ctx_texts = [p.text for p in ctx_turns.parts]
+    assert any(t.startswith("[UI Context]\n") for t in ctx_texts)
+    assert any(t.startswith("[Document Context]\n") for t in ctx_texts)
+    turns, turn_complete = fresh_client_contents[1]
     assert turn_complete is True
     assert turns.role == "user"
     assert turns.parts[0].text == "Where is Submit?"
@@ -384,17 +389,20 @@ async def test_screen_context_before_text_up_is_forwarded_on_lazy_session_start(
     await manager.handle_upstream(TextUpMessage(text="What do you see on the screen?"))
 
     assert manager._screen_sent_in_session is True
-    assert len(sent_inputs) == 3
+    assert len(sent_inputs) == 1
     assert "video" in sent_inputs[0]
     assert sent_inputs[0]["video"].data == b"fake-jpeg-bytes"
     assert sent_inputs[0]["video"].mime_type == "image/jpeg"
-    assert sent_inputs[1]["text"].startswith("[UI Context]\n")
-    assert "Reload" in sent_inputs[1]["text"]
-    assert sent_inputs[2]["text"].startswith("[Document Context]\n")
-    assert "Parhlo Architecture Spec" in sent_inputs[2]["text"]
 
-    assert len(sent_client_contents) == 1
-    turns, turn_complete = sent_client_contents[0]
+    assert len(sent_client_contents) == 2
+    ctx_turns, ctx_turn_complete = sent_client_contents[0]
+    assert ctx_turn_complete is False
+    assert ctx_turns.role == "user"
+    ctx_texts = [p.text for p in ctx_turns.parts]
+    assert any(t.startswith("[UI Context]\n") and "Reload" in t for t in ctx_texts)
+    assert any(t.startswith("[Document Context]\n") and "Parhlo Architecture Spec" in t for t in ctx_texts)
+
+    turns, turn_complete = sent_client_contents[1]
     assert turn_complete is True
     assert turns.role == "user"
     assert turns.parts[0].text == "What do you see on the screen?"
@@ -622,6 +630,7 @@ def test_detected_rects_and_document_context_parsing_and_fallback_grounding():
 async def test_periodic_screen_context_does_not_send_realtime_text_turns():
     emitted = []
     realtime_inputs = []
+    client_contents = []
 
     async def emit(msg):
         emitted.append(msg)
@@ -631,7 +640,7 @@ async def test_periodic_screen_context_does_not_send_realtime_text_turns():
             realtime_inputs.append(kwargs)
 
         async def send_client_content(self, *, turns=None, turn_complete=True):
-            return None
+            client_contents.append((turns, turn_complete))
 
         async def receive(self):
             await asyncio.sleep(10)
@@ -651,7 +660,7 @@ async def test_periodic_screen_context_does_not_send_realtime_text_turns():
     manager = GeminiLiveSessionManager(emit=emit, client=fake_client)
     await manager.handle_upstream(SessionControlMessage(action="start_session"))
 
-    # Periodic ScreenContextMessage updates must stream video only, never realtime text prompts.
+    # Periodic ScreenContextMessage updates must stream video only, never text turns.
     await manager.handle_upstream(
         ScreenContextMessage(
             screen_width=1440,
@@ -664,10 +673,371 @@ async def test_periodic_screen_context_does_not_send_realtime_text_turns():
     assert len(realtime_inputs) == 1
     assert "video" in realtime_inputs[0]
     assert all("text" not in item for item in realtime_inputs)
+    assert client_contents == []
 
-    # Explicit TextUpMessage flushes the changed UI/Document context along with the user turn.
+    # Explicit TextUpMessage flushes changed UI/Document context with turn_complete=False before user prompt.
     await manager.handle_upstream(TextUpMessage(text="What changed?"))
-    assert any(item.get("text", "").startswith("[UI Context]\n") for item in realtime_inputs)
-    assert any(item.get("text", "").startswith("[Document Context]\n") for item in realtime_inputs)
+    assert all("text" not in item for item in realtime_inputs)
+    assert len(client_contents) == 2
+    ctx_turns, ctx_complete = client_contents[0]
+    assert ctx_complete is False
+    ctx_texts = [p.text for p in ctx_turns.parts]
+    assert any(t.startswith("[UI Context]\n") for t in ctx_texts)
+    assert any(t.startswith("[Document Context]\n") for t in ctx_texts)
+    user_turns, user_complete = client_contents[1]
+    assert user_complete is True
+    assert user_turns.parts[0].text == "What changed?"
 
     await manager.stop()
+
+
+def test_build_live_config_includes_compression_and_session_resumption():
+    cfg = build_live_config()
+    assert cfg.context_window_compression is not None
+    assert cfg.context_window_compression.sliding_window is not None
+    assert cfg.session_resumption is not None
+    assert cfg.session_resumption.handle is None
+
+    resumed_cfg = build_live_config(session_resumption_handle="resume-token-xyz")
+    assert resumed_cfg.session_resumption is not None
+    assert resumed_cfg.session_resumption.handle == "resume-token-xyz"
+
+
+@pytest.mark.asyncio
+async def test_session_resumption_handle_lifecycle_and_go_away_proactive_reconnect():
+    emitted = []
+    connect_configs = []
+    closed_sessions = []
+
+    async def emit(msg):
+        emitted.append(msg)
+
+    class SessionOne:
+        async def receive(self):
+            yield SimpleNamespace(
+                session_resumption_update=SimpleNamespace(resumable=False, new_handle="ignored-bad")
+            )
+            yield SimpleNamespace(
+                session_resumption_update=SimpleNamespace(resumable=True, new_handle="handle-v1")
+            )
+            yield SimpleNamespace(
+                go_away=SimpleNamespace(time_left="5s"),
+                server_content=None,
+            )
+            await asyncio.sleep(10)
+
+    class SessionTwo:
+        async def receive(self):
+            await asyncio.sleep(10)
+            if False:
+                yield None
+
+    class FakeSessionCM:
+        def __init__(self, idx, session):
+            self._idx = idx
+            self._session = session
+
+        async def __aenter__(self):
+            return self._session
+
+        async def __aexit__(self, exc_type, exc, tb):
+            closed_sessions.append(self._idx)
+            return False
+
+    class FakeLive:
+        def connect(self, model, config):
+            connect_configs.append(config)
+            idx = len(connect_configs)
+            return FakeSessionCM(idx, SessionOne() if idx == 1 else SessionTwo())
+
+    manager = GeminiLiveSessionManager(
+        emit=emit,
+        client=SimpleNamespace(aio=SimpleNamespace(live=FakeLive())),
+    )
+
+    await manager.handle_upstream(SessionControlMessage(action="start_session"))
+    assert len(connect_configs) == 1
+    assert connect_configs[0].session_resumption.handle is None
+
+    # Allow SessionOne receive loop and proactive GoAway reconnect task to run
+    for _ in range(10):
+        await asyncio.sleep(0)
+        if len(connect_configs) >= 2:
+            break
+
+    assert len(connect_configs) == 2
+    assert connect_configs[1].session_resumption.handle == "handle-v1"
+    assert 1 in closed_sessions
+    assert manager._session_resumption_handle == "handle-v1"
+
+    # Explicit stop must clear resumption handle so next session starts fresh
+    await manager.handle_upstream(SessionControlMessage(action="stop_session"))
+    assert manager._session_resumption_handle is None
+
+    await manager.handle_upstream(SessionControlMessage(action="start_session"))
+    assert len(connect_configs) == 3
+    assert connect_configs[2].session_resumption.handle is None
+    await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_audio_reconnect_restores_screen_video_without_text_context():
+    emitted = []
+    fresh_realtime_inputs = []
+    fresh_client_contents = []
+    connect_calls = 0
+
+    async def emit(msg):
+        emitted.append(msg)
+
+    class StaleAudioSession:
+        async def send_realtime_input(self, **kwargs):
+            if "audio" in kwargs:
+                raise RuntimeError("socket dropped")
+
+        async def send_client_content(self, *, turns=None, turn_complete=True):
+            return None
+
+        async def receive(self):
+            await asyncio.sleep(10)
+            if False:
+                yield None
+
+    class HealthySession:
+        async def send_realtime_input(self, **kwargs):
+            fresh_realtime_inputs.append(kwargs)
+
+        async def send_client_content(self, *, turns=None, turn_complete=True):
+            fresh_client_contents.append((turns, turn_complete))
+
+        async def receive(self):
+            await asyncio.sleep(10)
+            if False:
+                yield None
+
+    class FakeSessionCM:
+        def __init__(self, session):
+            self._session = session
+
+        async def __aenter__(self):
+            return self._session
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeLive:
+        def connect(self, model, config):
+            nonlocal connect_calls
+            connect_calls += 1
+            return FakeSessionCM(StaleAudioSession() if connect_calls == 1 else HealthySession())
+
+    manager = GeminiLiveSessionManager(
+        emit=emit,
+        client=SimpleNamespace(aio=SimpleNamespace(live=FakeLive())),
+    )
+    await manager.handle_upstream(SessionControlMessage(action="start_session"))
+    await manager.handle_upstream(
+        ScreenContextMessage(
+            screen_width=1200,
+            screen_height=800,
+            jpeg_b64=base64.b64encode(b"cached-frame").decode("ascii"),
+            ax_elements=[AXElementBounds(role="AXButton", title="Save", x=10, y=10, width=50, height=20)],
+            document_context=DocumentContext(title="Doc", paragraphs=["Body"]),
+        )
+    )
+
+    pcm_b64 = base64.b64encode(b"\x10\x20").decode("ascii")
+    await manager.handle_upstream(AudioUpMessage(pcm_b64=pcm_b64))
+
+    assert connect_calls == 2
+    assert len(fresh_realtime_inputs) == 2
+    assert fresh_realtime_inputs[0]["video"].data == b"cached-frame"
+    assert fresh_realtime_inputs[1]["audio"].data == b"\x10\x20"
+    assert fresh_client_contents == []
+    await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_receive_loop_continues_across_multiple_turns():
+    emitted = []
+    connect_calls = 0
+
+    async def emit(msg):
+        emitted.append(msg)
+
+    class MultiTurnSession:
+        def __init__(self):
+            self.receive_calls = 0
+
+        async def receive(self):
+            self.receive_calls += 1
+            if self.receive_calls == 1:
+                yield SimpleNamespace(
+                    server_content=SimpleNamespace(
+                        model_turn=SimpleNamespace(
+                            parts=[SimpleNamespace(inline_data=SimpleNamespace(data=b"turn1"))]
+                        ),
+                        turn_complete=True,
+                    )
+                )
+                return
+            if self.receive_calls == 2:
+                yield SimpleNamespace(
+                    server_content=SimpleNamespace(
+                        model_turn=SimpleNamespace(
+                            parts=[SimpleNamespace(inline_data=SimpleNamespace(data=b"turn2"))]
+                        ),
+                        turn_complete=True,
+                    )
+                )
+                return
+            await asyncio.sleep(10)
+
+    session_instance = MultiTurnSession()
+
+    class FakeSessionCM:
+        async def __aenter__(self):
+            return session_instance
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeLive:
+        def connect(self, model, config):
+            nonlocal connect_calls
+            connect_calls += 1
+            return FakeSessionCM()
+
+    manager = GeminiLiveSessionManager(
+        emit=emit,
+        client=SimpleNamespace(aio=SimpleNamespace(live=FakeLive())),
+    )
+    await manager.handle_upstream(SessionControlMessage(action="start_session"))
+
+    for _ in range(10):
+        await asyncio.sleep(0)
+        if session_instance.receive_calls >= 3:
+            break
+
+    assert connect_calls == 1
+    assert session_instance.receive_calls == 3
+    audio_chunks = [base64.b64decode(m.pcm_b64) for m in emitted if isinstance(m, AudioDownMessage)]
+    assert audio_chunks == [b"turn1", b"turn2"]
+    assert emitted.count(HudStateMessage(state="idle")) == 2
+    await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_upstream_messages_serialized_by_session_lock():
+    emitted = []
+    connect_calls = 0
+    realtime_inputs = []
+    client_contents = []
+
+    async def emit(msg):
+        emitted.append(msg)
+
+    class FakeSession:
+        async def send_realtime_input(self, **kwargs):
+            realtime_inputs.append(kwargs)
+
+        async def send_client_content(self, *, turns=None, turn_complete=True):
+            client_contents.append((turns, turn_complete))
+
+        async def receive(self):
+            await asyncio.sleep(10)
+            if False:
+                yield None
+
+    class SlowSessionCM:
+        async def __aenter__(self):
+            await asyncio.sleep(0.02)
+            return FakeSession()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeLive:
+        def connect(self, model, config):
+            nonlocal connect_calls
+            connect_calls += 1
+            return SlowSessionCM()
+
+    manager = GeminiLiveSessionManager(
+        emit=emit,
+        client=SimpleNamespace(aio=SimpleNamespace(live=FakeLive())),
+    )
+
+    screen = ScreenContextMessage(
+        screen_width=1000,
+        screen_height=1000,
+        jpeg_b64=base64.b64encode(b"img").decode("ascii"),
+    )
+    audio = AudioUpMessage(pcm_b64=base64.b64encode(b"\x01\x02").decode("ascii"))
+
+    await asyncio.gather(
+        manager.handle_upstream(SessionControlMessage(action="start_session")),
+        manager.handle_upstream(screen),
+        manager.handle_upstream(audio),
+        manager.handle_upstream(TextUpMessage(text="hello")),
+    )
+
+    assert connect_calls == 1
+    assert any("audio" in item for item in realtime_inputs)
+    assert any("video" in item for item in realtime_inputs)
+    assert any(tc is True and t.parts[0].text == "hello" for t, tc in client_contents)
+    await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_interaction_status_interim_transcript_and_multi_parts(caplog):
+    emitted = []
+
+    async def emit(msg):
+        emitted.append(msg)
+
+    manager = GeminiLiveSessionManager(emit=emit)
+    manager._session = SimpleNamespace()
+
+    # 1. IN_PROGRESS + turn_complete=True (e.g. thinking filler) must stay in "thinking", not "idle"
+    with caplog.at_level(logging.INFO):
+        await manager.process_live_response(
+            SimpleNamespace(
+                tool_call_cancellation=SimpleNamespace(ids=["c-old"]),
+                server_content=SimpleNamespace(
+                    interim_input_transcription=SimpleNamespace(text="How do"),
+                    model_turn=SimpleNamespace(
+                        parts=[
+                            SimpleNamespace(thought=True, text="internal reasoning", inline_data=None),
+                            SimpleNamespace(inline_data=SimpleNamespace(data=b"a1"), text=None),
+                            SimpleNamespace(inline_data=SimpleNamespace(data=b"a2"), text=None),
+                        ]
+                    ),
+                    interaction_status=types.InteractionStatus.IN_PROGRESS,
+                    turn_complete=True,
+                ),
+            )
+        )
+
+    assert "cancelled tool calls" in caplog.text.lower()
+    assert [m for m in emitted if isinstance(m, InputTranscriptMessage)] == [
+        InputTranscriptMessage(text="How do", is_final=False)
+    ]
+    assert [base64.b64decode(m.pcm_b64) for m in emitted if isinstance(m, AudioDownMessage)] == [
+        b"a1",
+        b"a2",
+    ]
+    hud_states = [m.state for m in emitted if isinstance(m, HudStateMessage)]
+    assert hud_states == ["thinking"]
+
+    # 2. Final IDLE transition marks turn idle
+    emitted.clear()
+    await manager.process_live_response(
+        SimpleNamespace(
+            server_content=SimpleNamespace(
+                interaction_status=types.InteractionStatus.IDLE,
+                turn_complete=True,
+            )
+        )
+    )
+    assert emitted == [HudStateMessage(state="idle")]
