@@ -58,7 +58,9 @@ public final class OverlayStateStore {
         if existing == trimmed || existing.hasSuffix(trimmed) {
             return
         }
-        let separator = (rawDelta.first?.isWhitespace == true || existing.last?.isWhitespace == true) ? "" : " "
+        let startsWithPunctuation = rawDelta.first?.isWhitespace != true
+            && trimmed.first.map { ".,!?;:’'\")]}".contains($0) } == true
+        let separator = (existing.last?.isWhitespace == true || startsWithPunctuation) ? "" : " "
         let combined = existing + separator + trimmed
         messages[lastIndex] = ChatMessage(
             id: messages[lastIndex].id,

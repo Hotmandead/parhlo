@@ -20,6 +20,9 @@ public final class PrivacyFilter {
     public private(set) var isPaused: Bool = false
     public private(set) var frontmostBundleID: String?
     public private(set) var frontmostAppName: String?
+    public private(set) var lastExternalBundleID: String?
+    public private(set) var lastExternalAppName: String?
+    public let ownBundleID: String
 
     @ObservationIgnored public var onPauseStateChanged: ((Bool, String?) -> Void)?
 
@@ -28,10 +31,12 @@ public final class PrivacyFilter {
 
     public init(
         excludedBundleIDs: Set<String> = PrivacyFilter.defaultExcludedBundleIDs,
-        overlayStore: OverlayStateStore? = nil
+        overlayStore: OverlayStateStore? = nil,
+        ownBundleID: String = Bundle.main.bundleIdentifier ?? "com.parhlo.ScreenCompanionApp"
     ) {
         self.excludedBundleIDs = excludedBundleIDs
         self.overlayStore = overlayStore
+        self.ownBundleID = ownBundleID.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     deinit {
@@ -110,8 +115,26 @@ public final class PrivacyFilter {
         observationTask = nil
     }
 
+    /// Checks whether `bundleIdentifier` belongs to Parhlo itself.
+    public func isOwnApplication(_ bundleIdentifier: String?) -> Bool {
+        guard !ownBundleID.isEmpty,
+              let raw = bundleIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else {
+            return false
+        }
+        return raw.caseInsensitiveCompare(ownBundleID) == .orderedSame
+    }
+
     /// Evaluates a frontmost application change and notifies listeners + HUD when privacy pause toggles.
     public func evaluateFrontmostApplication(bundleIdentifier: String?, appName: String? = nil) {
+        // Ignore Parhlo self-activation (e.g., clicking the Notch Drawer or Settings) so an active
+        // privacy pause for a protected app behind Parhlo's non-windowed overlay is preserved.
+        if isOwnApplication(bundleIdentifier) {
+            return
+        }
+
+        lastExternalBundleID = bundleIdentifier
+        lastExternalAppName = appName
         frontmostBundleID = bundleIdentifier
         frontmostAppName = appName
 

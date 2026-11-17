@@ -171,6 +171,28 @@ public enum CoordinateConverter {
             height: CGFloat(rect.height)
         )
     }
+
+    /// Converts a Quartz global top-left `CGRect` into display-local top-left `CGRect` relative to `displayBounds`.
+    public static func toDisplayLocalRect(_ globalRect: CGRect, displayBounds: CGRect) -> CGRect {
+        CGRect(
+            x: globalRect.origin.x - displayBounds.origin.x,
+            y: globalRect.origin.y - displayBounds.origin.y,
+            width: globalRect.size.width,
+            height: globalRect.size.height
+        )
+    }
+
+    /// Clamps `point` inside `containerSize` leaving at least `inset` margin on each edge when space allows.
+    public static func clampedPoint(_ point: CGPoint, in containerSize: CGSize, inset: CGFloat = 12) -> CGPoint {
+        let minX = min(inset, containerSize.width * 0.5)
+        let maxX = max(minX, containerSize.width - minX)
+        let minY = min(inset, containerSize.height * 0.5)
+        let maxY = max(minY, containerSize.height - minY)
+        return CGPoint(
+            x: min(max(point.x, minX), maxX),
+            y: min(max(point.y, minY), maxY)
+        )
+    }
 }
 
 /// Parses `#RRGGBB` hex strings safely with a default Parhlo blue fallback.

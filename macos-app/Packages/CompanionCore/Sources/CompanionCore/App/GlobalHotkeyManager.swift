@@ -25,6 +25,8 @@ public struct ControlOptionChordDetector: Sendable, Equatable {
     private(set) var isChordActive: Bool = false
     private(set) var chordPressedAt: Date?
     private(set) var isSessionActive: Bool = false
+    private var sawDisqualifyingModifier: Bool = false
+    private var sessionStateBeforeChord: Bool = false
 
     public init(
         mode: HotkeyActivationMode = .smartTapOrHold,
@@ -42,13 +44,22 @@ public struct ControlOptionChordDetector: Sendable, Equatable {
 
     /// Processes a modifier change and returns `true` (start), `false` (stop), or `nil` (no change).
     public mutating func process(flags: NSEvent.ModifierFlags, now: Date = Date()) -> Bool? {
-        let chordDown = Self.isControlOptionChord(flags)
+        let relevant = flags.intersection([.control, .option, .command, .shift])
+        let hasDisqualifying = !relevant.intersection([.command, .shift]).isEmpty
+        if hasDisqualifying {
+            sawDisqualifyingModifier = true
+        } else if relevant.isEmpty {
+            sawDisqualifyingModifier = false
+        }
+
+        let chordDown = !sawDisqualifyingModifier && Self.isControlOptionChord(flags)
         guard chordDown != isChordActive else { return nil }
 
         isChordActive = chordDown
 
         if chordDown {
             chordPressedAt = now
+            sessionStateBeforeChord = isSessionActive
             switch mode {
             case .holdToSpeak:
                 if !isSessionActive {
@@ -63,6 +74,11 @@ public struct ControlOptionChordDetector: Sendable, Equatable {
         } else {
             let heldDuration = chordPressedAt.map { now.timeIntervalSince($0) } ?? 0
             chordPressedAt = nil
+
+            if hasDisqualifying && heldDuration < 0.25 && !sessionStateBeforeChord && isSessionActive {
+                isSessionActive = false
+                return false
+            }
 
             switch mode {
             case .tapToToggle:
@@ -89,6 +105,14 @@ public struct ControlOptionChordDetector: Sendable, Equatable {
     }
 }
 
+private final class MonitorTokenBox: @unchecked Sendable {
+    let value: Any
+
+    init(_ value: Any) {
+        self.value = value
+    }
+}
+
 /// Registers global and local macOS modifier monitors for `Control+Option` (`⌃⌥`) voice activation.
 @MainActor
 @Observable
@@ -97,50 +121,83 @@ public final class GlobalHotkeyManager {
         didSet { detector.mode = mode }
     }
     public private(set) var isMonitoring: Bool = false
+    public private(set) var isGlobalMonitorActive: Bool = false
 
     @ObservationIgnored public var onSessionRequested: (@MainActor (Bool) -> Void)?
 
     @ObservationIgnored private var detector = ControlOptionChordDetector()
-    @ObservationIgnored private var globalMonitor: Any?
-    @ObservationIgnored private var localMonitor: Any?
+    @ObservationIgnored private nonisolated(unsafe) var globalMonitor: MonitorTokenBox?
+    @ObservationIgnored private nonisolated(unsafe) var localMonitor: MonitorTokenBox?
 
     public init(mode: HotkeyActivationMode = .smartTapOrHold) {
         self.mode = mode
         self.detector.mode = mode
     }
 
+    deinit {
+        let global = globalMonitor
+        let local = localMonitor
+        globalMonitor = nil
+        localMonitor = nil
+        if global != nil || local != nil {
+            if Thread.isMainThread {
+                MainActor.assumeIsolated {
+                    if let global { NSEvent.removeMonitor(global.value) }
+                    if let local { NSEvent.removeMonitor(local.value) }
+                }
+            } else {
+                Task { @MainActor in
+                    if let global { NSEvent.removeMonitor(global.value) }
+                    if let local { NSEvent.removeMonitor(local.value) }
+                }
+            }
+        }
+    }
+
     /// Installs global + local `.flagsChanged` monitors so `Control+Option` works across any app.
     public func startMonitoring() {
-        guard !isMonitoring else { return }
-
-        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
-            let flags = event.modifierFlags
-            Task { @MainActor [weak self] in
-                self?.handleModifierFlags(flags)
+        if globalMonitor == nil {
+            let monitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+                let flags = event.modifierFlags
+                let now = Date()
+                Task { @MainActor [weak self] in
+                    self?.handleModifierFlags(flags, now: now)
+                }
+            }
+            if let monitor {
+                globalMonitor = MonitorTokenBox(monitor)
             }
         }
 
-        localMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
-            let flags = event.modifierFlags
-            Task { @MainActor [weak self] in
-                self?.handleModifierFlags(flags)
+        if localMonitor == nil {
+            let monitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+                let flags = event.modifierFlags
+                let now = Date()
+                Task { @MainActor [weak self] in
+                    self?.handleModifierFlags(flags, now: now)
+                }
+                return event
             }
-            return event
+            if let monitor {
+                localMonitor = MonitorTokenBox(monitor)
+            }
         }
 
-        isMonitoring = true
+        isGlobalMonitorActive = (globalMonitor != nil)
+        isMonitoring = (globalMonitor != nil || localMonitor != nil)
     }
 
     /// Removes active modifier monitors.
     public func stopMonitoring() {
         if let globalMonitor {
-            NSEvent.removeMonitor(globalMonitor)
+            NSEvent.removeMonitor(globalMonitor.value)
             self.globalMonitor = nil
         }
         if let localMonitor {
-            NSEvent.removeMonitor(localMonitor)
+            NSEvent.removeMonitor(localMonitor.value)
             self.localMonitor = nil
         }
+        isGlobalMonitorActive = false
         isMonitoring = false
     }
 

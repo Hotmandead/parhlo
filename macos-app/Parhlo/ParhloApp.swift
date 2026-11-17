@@ -5,6 +5,8 @@ import SwiftUI
 @main
 @MainActor
 final class ParhloAppDelegate: NSObject, NSApplicationDelegate {
+    private static var retainedDelegate: ParhloAppDelegate?
+
     private var statusItem: NSStatusItem?
     private let coordinator = AppCoordinator()
     private var notchPanelController: NotchPanelWindowController?
@@ -13,9 +15,12 @@ final class ParhloAppDelegate: NSObject, NSApplicationDelegate {
     static func main() {
         let app = NSApplication.shared
         let delegate = ParhloAppDelegate()
+        retainedDelegate = delegate
         app.delegate = delegate
         app.setActivationPolicy(.accessory)
-        app.run()
+        withExtendedLifetime(delegate) {
+            app.run()
+        }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -117,6 +122,7 @@ final class ParhloAppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func openSettingsWindow() {
         coordinator.permissionsManager.refresh()
+        notchPanelController?.setExpanded(false, activateApp: false)
 
         if let existing = settingsWindow {
             existing.makeKeyAndOrderFront(nil)

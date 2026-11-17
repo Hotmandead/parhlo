@@ -33,11 +33,15 @@ public final class OfflineSpeechManager {
             return
         }
 
-        utteranceGeneration &+= 1
-        delegateProxy.setGeneration(utteranceGeneration)
-
         let utterance = AVSpeechUtterance(string: trimmed)
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate
+
+        utteranceGeneration &+= 1
+        delegateProxy.setActiveUtterance(
+            id: ObjectIdentifier(utterance),
+            generation: utteranceGeneration
+        )
+
         isSpeaking = true
         synthesizer.speak(utterance)
     }
@@ -45,7 +49,7 @@ public final class OfflineSpeechManager {
     /// Immediately halts any active or queued speech synthesis.
     public func stopImmediately() {
         utteranceGeneration &+= 1
-        delegateProxy.setGeneration(utteranceGeneration)
+        delegateProxy.clearActiveUtterance(generation: utteranceGeneration)
         _ = synthesizer.stopSpeaking(at: .immediate)
         isSpeaking = false
     }
@@ -54,13 +58,22 @@ public final class OfflineSpeechManager {
 private final class SpeechSynthesizerDelegateProxy: NSObject, AVSpeechSynthesizerDelegate, @unchecked Sendable {
     private struct State {
         var generation: UInt64 = 0
+        var activeUtteranceID: ObjectIdentifier?
         var onDidFinishOrCancel: (@Sendable (UInt64) -> Void)?
     }
 
     private let lock = OSAllocatedUnfairLock<State>(initialState: State())
 
-    func setGeneration(_ generation: UInt64) {
+    func setActiveUtterance(id: ObjectIdentifier, generation: UInt64) {
         lock.withLock { state in
+            state.activeUtteranceID = id
+            state.generation = generation
+        }
+    }
+
+    func clearActiveUtterance(generation: UInt64) {
+        lock.withLock { state in
+            state.activeUtteranceID = nil
             state.generation = generation
         }
     }
@@ -72,17 +85,23 @@ private final class SpeechSynthesizerDelegateProxy: NSObject, AVSpeechSynthesize
     }
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-        notifyCompletion()
+        notifyCompletion(for: ObjectIdentifier(utterance))
     }
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-        notifyCompletion()
+        notifyCompletion(for: ObjectIdentifier(utterance))
     }
 
-    nonisolated private func notifyCompletion() {
-        let (generation, handler) = lock.withLock { state in
-            (state.generation, state.onDidFinishOrCancel)
+    nonisolated private func notifyCompletion(for utteranceID: ObjectIdentifier) {
+        let match: (UInt64, (@Sendable (UInt64) -> Void)?) = lock.withLock { state in
+            guard state.activeUtteranceID == utteranceID else {
+                return (0, nil)
+            }
+            state.activeUtteranceID = nil
+            return (state.generation, state.onDidFinishOrCancel)
         }
-        handler?(generation)
+        if let handler = match.1 {
+            handler(match.0)
+        }
     }
 }

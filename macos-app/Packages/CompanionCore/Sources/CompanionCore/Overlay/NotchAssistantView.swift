@@ -11,6 +11,7 @@ public enum AssistantDrawerTab: String, Sendable {
 public struct NotchAssistantView: View {
     @Bindable private var coordinator: AppCoordinator
     @Bindable private var overlayStore: OverlayStateStore
+    @Bindable private var audioManager: AudioEngineManager
     @Binding private var isExpanded: Bool
     private let onOpenSettings: () -> Void
     private let onResizeNeeded: (Bool) -> Void
@@ -28,10 +29,18 @@ public struct NotchAssistantView: View {
     ) {
         self.coordinator = coordinator
         self.overlayStore = coordinator.overlayStore
+        self.audioManager = coordinator.audioManager
         self._isExpanded = isExpanded
         self.onOpenSettings = onOpenSettings
         self.onResizeNeeded = onResizeNeeded
         self.onRequestKeyFocus = onRequestKeyFocus
+    }
+
+    /// Maps raw 16 kHz PCM RMS `[0, ~0.15+]` to a `[0, 1]` UI meter level with perceptual curve.
+    nonisolated public static func normalizedMicLevel(rms: Float) -> Double {
+        let clamped = max(0.0, Double(rms))
+        guard clamped > 0 else { return 0.0 }
+        return min(1.0, sqrt(clamped / 0.14))
     }
 
     public var body: some View {
@@ -63,14 +72,15 @@ public struct NotchAssistantView: View {
         Button {
             withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) {
                 isExpanded = true
-                onResizeNeeded(true)
             }
         } label: {
             HStack(spacing: 8) {
                 Circle()
                     .fill(statusColor)
                     .frame(width: 7, height: 7)
-                    .shadow(color: statusColor.opacity(0.85), radius: 4)
+                    .scaleEffect(coordinator.isSessionActive ? (1.0 + micActivityLevel * 0.45) : 1.0)
+                    .shadow(color: statusColor.opacity(0.85), radius: coordinator.isSessionActive ? (4 + micActivityLevel * 4) : 4)
+                    .animation(.easeOut(duration: 0.08), value: micActivityLevel)
 
                 Image(systemName: coordinator.isSessionActive ? "waveform" : "sparkles")
                     .font(.system(size: 11, weight: .semibold))
@@ -167,6 +177,9 @@ public struct NotchAssistantView: View {
                 Text(drawerStatusTitle)
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.white.opacity(0.75))
+                if coordinator.isSessionActive {
+                    MicActivityMeterView(level: micActivityLevel, tint: statusColor)
+                }
             }
 
             Spacer()
@@ -182,7 +195,6 @@ public struct NotchAssistantView: View {
                 circularToolbarButton(icon: "arrow.down.right.and.arrow.up.left", help: "Collapse to Notch Pill") {
                     withAnimation(.spring(response: 0.25, dampingFraction: 0.88)) {
                         isExpanded = false
-                        onResizeNeeded(false)
                     }
                 }
             }
@@ -293,14 +305,20 @@ public struct NotchAssistantView: View {
 
             ZStack {
                 Circle()
-                    .fill(statusColor.opacity(0.16))
+                    .fill(statusColor.opacity(coordinator.isSessionActive ? (0.14 + micActivityLevel * 0.22) : 0.16))
                     .frame(width: 92, height: 92)
+                    .scaleEffect(coordinator.isSessionActive ? (1.0 + micActivityLevel * 0.24) : 1.0)
+                    .animation(.easeOut(duration: 0.08), value: micActivityLevel)
                 Circle()
                     .strokeBorder(statusColor.opacity(0.65), lineWidth: 2)
                     .frame(width: 72, height: 72)
                 Image(systemName: coordinator.isSessionActive ? "waveform" : "mic.fill")
                     .font(.system(size: 28, weight: .semibold))
                     .foregroundStyle(.white)
+            }
+
+            if coordinator.isSessionActive {
+                MicActivityMeterView(level: micActivityLevel, tint: statusColor, barCount: 5, maxHeight: 16)
             }
 
             VStack(spacing: 4) {
@@ -435,7 +453,12 @@ public struct NotchAssistantView: View {
             .background(Color.white.opacity(0.08), in: Capsule())
             .overlay(
                 Capsule()
-                    .strokeBorder(Color(red: 0.42, green: 0.62, blue: 0.96).opacity(0.55), lineWidth: 1)
+                    .strokeBorder(
+                        coordinator.isSessionActive
+                            ? Color.green.opacity(0.65)
+                            : Color(red: 0.42, green: 0.62, blue: 0.96).opacity(0.55),
+                        lineWidth: 1
+                    )
             )
         }
     }
@@ -461,6 +484,10 @@ public struct NotchAssistantView: View {
         return coordinator.overlayStore.hudState.displayTitle
     }
 
+    private var micActivityLevel: Double {
+        Self.normalizedMicLevel(rms: audioManager.inputRMSLevel)
+    }
+
     private var statusColor: Color {
         switch coordinator.overlayStore.hudState {
         case .idle: coordinator.isSessionActive ? .green : .blue
@@ -469,6 +496,29 @@ public struct NotchAssistantView: View {
         case .drawing: .blue
         case .privacyPaused: .red
         }
+    }
+}
+
+private struct MicActivityMeterView: View {
+    let level: Double
+    let tint: Color
+    var barCount: Int = 4
+    var maxHeight: CGFloat = 12
+
+    private static let weights: [Double] = [0.55, 0.9, 1.0, 0.75, 0.5]
+
+    var body: some View {
+        HStack(spacing: 2.5) {
+            ForEach(0..<barCount, id: \.self) { index in
+                let weight = Self.weights[index % Self.weights.count]
+                let barHeight = max(3.0, CGFloat(level * weight) * maxHeight)
+                Capsule()
+                    .fill(level > 0.04 ? tint : Color.white.opacity(0.32))
+                    .frame(width: 2.5, height: barHeight)
+            }
+        }
+        .frame(height: maxHeight)
+        .animation(.easeOut(duration: 0.08), value: level)
     }
 }
 

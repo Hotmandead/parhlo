@@ -60,6 +60,7 @@ public final class NotchPanelWindowController {
     private let onOpenSettings: () -> Void
     private var hostingController: NSHostingController<NotchAssistantView>?
     private var trackingContainerView: NotchHoverTrackingView?
+    private var activeScreen: NSScreen?
     nonisolated(unsafe) private var screenTask: Task<Void, Never>?
     nonisolated(unsafe) private var hoverCollapseTask: Task<Void, Never>?
     nonisolated(unsafe) private var globalMouseMonitor: EventMonitorBox?
@@ -115,6 +116,14 @@ public final class NotchPanelWindowController {
             && abs(point.x - screenFrame.midX) <= 150
     }
 
+    /// Returns the first screen frame from `screenFrames` whose top-center notch trigger strip contains `point`.
+    nonisolated public static func matchingTriggerScreenFrame(
+        for point: NSPoint,
+        in screenFrames: [NSRect]
+    ) -> NSRect? {
+        screenFrames.first { isPointInTopTriggerZone(point, screenFrame: $0) }
+    }
+
     /// Returns `true` when `point` is inside the expanded drawer bounds with a 16pt grace margin.
     nonisolated public static func isPointInsideExpandedDrawer(_ point: NSPoint, panelFrame: NSRect) -> Bool {
         panelFrame.insetBy(dx: -16, dy: -16).contains(point)
@@ -135,6 +144,13 @@ public final class NotchPanelWindowController {
     }
 
     public func setExpanded(_ expanded: Bool, activateApp: Bool) {
+        setExpanded(expanded, activateApp: activateApp, on: activeScreen ?? panel.screen ?? NSScreen.main)
+    }
+
+    private func setExpanded(_ expanded: Bool, activateApp: Bool, on screen: NSScreen?) {
+        if let screen {
+            activeScreen = screen
+        }
         isExpanded = expanded
         panel.allowKeyFocus = expanded
         if !expanded || activateApp {
@@ -143,7 +159,7 @@ public final class NotchPanelWindowController {
             openedViaHover = false
         }
         refreshContentView()
-        updatePanelFrame(expanded: expanded)
+        updatePanelFrame(expanded: expanded, on: screen)
         if expanded {
             if activateApp {
                 panel.makeKeyAndOrderFront(nil)
@@ -152,8 +168,15 @@ public final class NotchPanelWindowController {
                 panel.orderFrontRegardless()
             }
         } else {
+            panel.resignKey()
             panel.orderFrontRegardless()
         }
+    }
+
+    /// Minimizes the drawer back to the notch pill when opening Settings.
+    internal func handleOpenSettingsFromDrawer() {
+        setExpanded(false, activateApp: false)
+        onOpenSettings()
     }
 
     /// Pins a hover-opened drawer open and gives it key focus so keyboard input works seamlessly.
@@ -223,21 +246,32 @@ public final class NotchPanelWindowController {
 
     /// Evaluates cursor position to expand on top-notch hover or schedule collapse on drawer exit.
     public func handleMouseLocation(_ point: NSPoint) {
-        let screenFrame = (panel.screen ?? NSScreen.main ?? NSScreen.screens.first)?.frame
-            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let screens = NSScreen.screens
 
         if !isExpanded {
-            if Self.isPointInTopTriggerZone(point, screenFrame: screenFrame) {
+            if let matchedScreen = screens.first(where: { Self.isPointInTopTriggerZone(point, screenFrame: $0.frame) }) {
                 hoverCollapseTask?.cancel()
                 hoverCollapseTask = nil
                 openedViaHover = true
-                setExpanded(true, activateApp: false)
+                activeScreen = matchedScreen
+                setExpanded(true, activateApp: false, on: matchedScreen)
+            } else if screens.isEmpty {
+                let fallbackFrame = (activeScreen ?? panel.screen ?? NSScreen.main)?.frame
+                    ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+                if Self.isPointInTopTriggerZone(point, screenFrame: fallbackFrame) {
+                    hoverCollapseTask?.cancel()
+                    hoverCollapseTask = nil
+                    openedViaHover = true
+                    setExpanded(true, activateApp: false, on: nil)
+                }
             }
             return
         }
 
+        let currentScreenFrame = (activeScreen ?? panel.screen ?? NSScreen.main ?? screens.first)?.frame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let insideDrawer = Self.isPointInsideExpandedDrawer(point, panelFrame: panel.frame)
-        let inTriggerZone = Self.isPointInTopTriggerZone(point, screenFrame: screenFrame)
+        let inTriggerZone = Self.isPointInTopTriggerZone(point, screenFrame: currentScreenFrame)
 
         if insideDrawer || inTriggerZone {
             hoverCollapseTask?.cancel()
@@ -258,10 +292,10 @@ public final class NotchPanelWindowController {
                 self.hoverCollapseTask = nil
 
                 let currentPoint = NSEvent.mouseLocation
-                let currentScreenFrame = (self.panel.screen ?? NSScreen.main ?? NSScreen.screens.first)?.frame
+                let targetFrame = (self.activeScreen ?? self.panel.screen ?? NSScreen.main ?? NSScreen.screens.first)?.frame
                     ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
                 let stillInside = Self.isPointInsideExpandedDrawer(currentPoint, panelFrame: self.panel.frame)
-                    || Self.isPointInTopTriggerZone(currentPoint, screenFrame: currentScreenFrame)
+                    || Self.isPointInTopTriggerZone(currentPoint, screenFrame: targetFrame)
 
                 guard self.isExpanded,
                       self.openedViaHover,
@@ -283,7 +317,9 @@ public final class NotchPanelWindowController {
         let rootView = NotchAssistantView(
             coordinator: coordinator,
             isExpanded: binding,
-            onOpenSettings: onOpenSettings,
+            onOpenSettings: { [weak self] in
+                self?.handleOpenSettingsFromDrawer()
+            },
             onResizeNeeded: { [weak self] expanded in
                 self?.updatePanelFrame(expanded: expanded)
             },
@@ -315,10 +351,13 @@ public final class NotchPanelWindowController {
         }
     }
 
-    private func updatePanelFrame(expanded: Bool) {
+    private func updatePanelFrame(expanded: Bool, on screen: NSScreen? = nil) {
         let targetSize = expanded ? Self.expandedSize : Self.collapsedSize
-        let frame = Self.frame(for: targetSize, on: panel.screen ?? NSScreen.main)
-        panel.setFrame(frame, display: true, animate: true)
+        let targetScreen = screen ?? activeScreen ?? panel.screen ?? NSScreen.main ?? NSScreen.screens.first
+        let frame = Self.frame(for: targetSize, on: targetScreen)
+        if panel.frame != frame {
+            panel.setFrame(frame, display: true, animate: true)
+        }
     }
 
     private static func frame(for size: CGSize, on screen: NSScreen?) -> NSRect {

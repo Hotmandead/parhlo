@@ -26,9 +26,10 @@ public struct VectorAnnotationLayerView: NSViewRepresentable {
 /// Layer-backed `NSView` drawing animated `CAShapeLayer` highlights, pulsing rings, and arrows.
 @MainActor
 public final class VectorAnnotationNSView: NSView {
-    private var annotationLayers: [String: CALayer] = [:]
+    internal private(set) var annotationLayers: [String: CALayer] = [:]
     private var lastHighlights: [DrawCommandMessage] = []
     private var lastArrows: [DrawCommandMessage] = []
+    private var renderedCommandsById: [String: DrawCommandMessage] = [:]
 
     public override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -43,16 +44,18 @@ public final class VectorAnnotationNSView: NSView {
 
     public override func layout() {
         super.layout()
-        rebuildAllLayers(animateNewOnly: false)
+        rebuildAllLayers(animateNewOnly: false, previousCommands: renderedCommandsById)
     }
 
     public func update(highlights: [DrawCommandMessage], arrows: [DrawCommandMessage]) {
-        let oldIds = Set(lastHighlights.map(\.commandId) + lastArrows.map(\.commandId))
+        let previousCommands = renderedCommandsById
+        let oldIds = Set(previousCommands.keys)
         lastHighlights = highlights
         lastArrows = arrows
         let newIds = Set(highlights.map(\.commandId) + arrows.map(\.commandId))
 
         for removed in oldIds.subtracting(newIds) {
+            renderedCommandsById.removeValue(forKey: removed)
             guard let removedLayer = annotationLayers.removeValue(forKey: removed) else { continue }
             CATransaction.begin()
             CATransaction.setCompletionBlock {
@@ -68,16 +71,75 @@ public final class VectorAnnotationNSView: NSView {
             CATransaction.commit()
         }
 
-        rebuildAllLayers(animateNewOnly: true, existingIds: oldIds)
+        rebuildAllLayers(animateNewOnly: true, previousCommands: previousCommands)
     }
 
-    private func rebuildAllLayers(animateNewOnly: Bool, existingIds: Set<String> = []) {
+    /// Resolves an arrow's start point in top-left pixel coordinates, synthesizing a ~56 pt diagonal
+    /// offset origin clamped safely inside `canvasSize` when `explicitFrom` is `nil`.
+    nonisolated public static func resolvedArrowStartPoint(
+        from explicitFrom: Point2D?,
+        to toPoint: Point2D,
+        canvasSize: CGSize
+    ) -> Point2D {
+        if let explicitFrom {
+            return explicitFrom
+        }
+
+        // 40x40 offset gives sqrt(40^2 + 40^2) ~= 56.6 pt diagonal shaft.
+        let step = 40
+        let edgeMargin = 12
+        let width = max(1, Int(canvasSize.width.rounded()))
+        let height = max(1, Int(canvasSize.height.rounded()))
+
+        let dx = toPoint.x >= (step + edgeMargin * 2) ? -step : step
+        let dy = toPoint.y >= (step + edgeMargin * 2) ? -step : step
+
+        let minX = min(edgeMargin, width / 2)
+        let maxX = max(minX, width - minX)
+        let minY = min(edgeMargin, height / 2)
+        let maxY = max(minY, height - minY)
+
+        let clampedX = min(max(toPoint.x + dx, minX), maxX)
+        let clampedY = min(max(toPoint.y + dy, minY), maxY)
+        return Point2D(x: clampedX, y: clampedY)
+    }
+
+    /// Returns `true` when `style` enables the animated spotlight/pulse halo ring.
+    nonisolated public static func shouldShowPulseRing(style: String?) -> Bool {
+        guard let normalized = style?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else {
+            return false
+        }
+        return normalized == "pulse" || normalized == "spotlight"
+    }
+
+    /// Returns trimmed non-empty label text if present on `command`.
+    nonisolated public static func trimmedLabel(for command: DrawCommandMessage) -> String? {
+        guard let raw = command.label?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else {
+            return nil
+        }
+        return raw
+    }
+
+    private func rebuildAllLayers(
+        animateNewOnly: Bool,
+        previousCommands: [String: DrawCommandMessage]
+    ) {
         guard let rootLayer = layer, bounds.width > 0, bounds.height > 0 else { return }
 
         for highlight in lastHighlights {
-            guard let pixelRect = highlight.pixelRect else { continue }
-            let isNew = !animateNewOnly || !existingIds.contains(highlight.commandId)
-            if annotationLayers[highlight.commandId] == nil || !animateNewOnly {
+            guard let pixelRect = highlight.pixelRect else {
+                annotationLayers.removeValue(forKey: highlight.commandId)?.removeFromSuperlayer()
+                renderedCommandsById.removeValue(forKey: highlight.commandId)
+                continue
+            }
+            let previous = previousCommands[highlight.commandId]
+            let isNew = !animateNewOnly || previous == nil
+            let needsRebuild = annotationLayers[highlight.commandId] == nil
+                || !animateNewOnly
+                || previous != highlight
+
+            if needsRebuild {
                 annotationLayers[highlight.commandId]?.removeFromSuperlayer()
                 let container = makeHighlightLayer(
                     command: highlight,
@@ -87,12 +149,27 @@ public final class VectorAnnotationNSView: NSView {
                 rootLayer.addSublayer(container)
                 annotationLayers[highlight.commandId] = container
             }
+            renderedCommandsById[highlight.commandId] = highlight
         }
 
         for arrow in lastArrows {
-            guard let fromPoint = arrow.fromPoint, let toPoint = arrow.toPoint else { continue }
-            let isNew = !animateNewOnly || !existingIds.contains(arrow.commandId)
-            if annotationLayers[arrow.commandId] == nil || !animateNewOnly {
+            guard let toPoint = arrow.toPoint else {
+                annotationLayers.removeValue(forKey: arrow.commandId)?.removeFromSuperlayer()
+                renderedCommandsById.removeValue(forKey: arrow.commandId)
+                continue
+            }
+            let fromPoint = Self.resolvedArrowStartPoint(
+                from: arrow.fromPoint,
+                to: toPoint,
+                canvasSize: bounds.size
+            )
+            let previous = previousCommands[arrow.commandId]
+            let isNew = !animateNewOnly || previous == nil
+            let needsRebuild = annotationLayers[arrow.commandId] == nil
+                || !animateNewOnly
+                || previous != arrow
+
+            if needsRebuild {
                 annotationLayers[arrow.commandId]?.removeFromSuperlayer()
                 let container = makeArrowLayer(
                     command: arrow,
@@ -103,6 +180,7 @@ public final class VectorAnnotationNSView: NSView {
                 rootLayer.addSublayer(container)
                 annotationLayers[arrow.commandId] = container
             }
+            renderedCommandsById[arrow.commandId] = arrow
         }
     }
 
@@ -120,7 +198,7 @@ public final class VectorAnnotationNSView: NSView {
         let boxPath = CGPath(roundedRect: rect, cornerWidth: cornerRadius, cornerHeight: cornerRadius, transform: nil)
 
         // Optional pulsing spotlight ring behind the primary stroke.
-        if command.style == "pulse" {
+        if Self.shouldShowPulseRing(style: command.style) {
             let pulseLayer = CAShapeLayer()
             let pulseRect = rect.insetBy(dx: -8, dy: -8)
             pulseLayer.frame = bounds
@@ -177,6 +255,16 @@ public final class VectorAnnotationNSView: NSView {
         }
 
         container.addSublayer(boxLayer)
+
+        if let labelText = Self.trimmedLabel(for: command) {
+            let tagLayer = makeLabelTagLayer(
+                text: labelText,
+                accentColor: color,
+                anchorRect: rect
+            )
+            container.addSublayer(tagLayer)
+        }
+
         return container
     }
 
@@ -254,6 +342,83 @@ public final class VectorAnnotationNSView: NSView {
 
         container.addSublayer(shaftLayer)
         container.addSublayer(headLayer)
+
+        if let labelText = Self.trimmedLabel(for: command) {
+            // Anchor the label near the arrow tail so it stays visible without obscuring the target point.
+            let anchorRect = CGRect(x: start.x - 16, y: start.y - 4, width: 32, height: 8)
+            let tagLayer = makeLabelTagLayer(
+                text: labelText,
+                accentColor: color,
+                anchorRect: anchorRect
+            )
+            container.addSublayer(tagLayer)
+        }
+
         return container
+    }
+
+    private func makeLabelTagLayer(
+        text: String,
+        accentColor: NSColor,
+        anchorRect: CGRect
+    ) -> CALayer {
+        let font = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        let measured = (text as NSString).size(withAttributes: [.font: font])
+        let horizontalPadding: CGFloat = 10
+        let verticalPadding: CGFloat = 4
+        let maxTagWidth = min(240, max(60, bounds.width - 16))
+        let tagWidth = min(maxTagWidth, ceil(measured.width) + horizontalPadding * 2)
+        let tagHeight = ceil(measured.height) + verticalPadding * 2
+
+        let margin: CGFloat = 8
+        let gap: CGFloat = 6
+        let maxOriginX = max(margin, bounds.width - tagWidth - margin)
+        let originX = min(max(anchorRect.minX, margin), maxOriginX)
+
+        // Prefer above the anchor rect (AppKit +Y is up); fall back below if too close to top edge.
+        let preferredTopY = anchorRect.maxY + gap
+        let fallbackBottomY = anchorRect.minY - tagHeight - gap
+        let rawY: CGFloat
+        if preferredTopY + tagHeight <= bounds.height - margin {
+            rawY = preferredTopY
+        } else if fallbackBottomY >= margin {
+            rawY = fallbackBottomY
+        } else {
+            rawY = bounds.height - tagHeight - margin
+        }
+        let maxOriginY = max(margin, bounds.height - tagHeight - margin)
+        let originY = min(max(rawY, margin), maxOriginY)
+
+        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
+
+        let pill = CALayer()
+        pill.frame = CGRect(x: originX, y: originY, width: tagWidth, height: tagHeight)
+        pill.backgroundColor = NSColor(red: 0.07, green: 0.08, blue: 0.11, alpha: 0.88).cgColor
+        pill.borderColor = accentColor.withAlphaComponent(0.9).cgColor
+        pill.borderWidth = 1.25
+        pill.cornerRadius = tagHeight * 0.5
+        pill.shadowColor = NSColor.black.cgColor
+        pill.shadowOpacity = 0.35
+        pill.shadowRadius = 6
+        pill.shadowOffset = CGSize(width: 0, height: -2)
+        pill.contentsScale = scale
+
+        let textLayer = CATextLayer()
+        textLayer.frame = CGRect(
+            x: horizontalPadding,
+            y: floor((tagHeight - measured.height) * 0.5) - 0.5,
+            width: tagWidth - horizontalPadding * 2,
+            height: ceil(measured.height) + 1
+        )
+        textLayer.string = text
+        textLayer.font = font
+        textLayer.fontSize = 12
+        textLayer.foregroundColor = NSColor.white.cgColor
+        textLayer.alignmentMode = .center
+        textLayer.truncationMode = .end
+        textLayer.contentsScale = scale
+
+        pill.addSublayer(textLayer)
+        return pill
     }
 }

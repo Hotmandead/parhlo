@@ -60,10 +60,33 @@ struct Phase5IntelligenceTests {
     @Test("VisionRedactor.redactSensitiveText masks inline secrets and SemanticPIIClassifier flags contextual PII")
     func semanticPrivacyAndInlineRedaction() async throws {
         let redactor = VisionRedactor()
+        #expect(redactor.preferCPUOnly == true)
         let raw = "Export key sk-proj-1234567890abcdefghijklmnop for deployment."
         let sanitized = redactor.redactSensitiveText(raw)
         #expect(!sanitized.contains("sk-proj-1234567890"))
         #expect(sanitized.contains("[REDACTED]"))
+
+        let grounder = VisionGrounder()
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let ctx = try #require(
+            CGContext(
+                data: nil,
+                width: 32,
+                height: 32,
+                bitsPerComponent: 8,
+                bytesPerRow: 0,
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            )
+        )
+        let dummyImage = try #require(ctx.makeImage())
+        let docContext = await grounder.extractDocumentContext(
+            from: dummyImage,
+            redactor: redactor,
+            fallbackText: "Parhlo Build Status\nAPI key sk-proj-1234567890abcdefghijklmnop"
+        )
+        #expect(docContext?.paragraphs.count == 2)
+        #expect(docContext?.paragraphs.last?.contains("[REDACTED]") == true)
 
         let classifier = HeuristicSemanticPIIClassifier()
         let lines = [

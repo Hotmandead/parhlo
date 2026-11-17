@@ -19,12 +19,27 @@ public final class AppCoordinator {
     public let overlayController: OverlayWindowController
 
     public var backendMode: AssistantBackendMode = .auto
-    public private(set) var isSessionActive: Bool = false
+    public internal(set) var isSessionActive: Bool = false
     public private(set) var lastStatusError: String?
+    public var speechStopAutoSendDelay: TimeInterval = 1.15
+    public var finalTranscriptAutoSendDelay: TimeInterval = 0.15
+    public var maxSpeechEnergyExtensionDelay: TimeInterval = 2.2
     @ObservationIgnored private var lastSurfacedSpeechError: String?
     @ObservationIgnored private var lastSurfacedAudioError: String?
     @ObservationIgnored private var lastAppliedDictationText: String = ""
     @ObservationIgnored private var isStreamingAssistantTurn: Bool = false
+    @ObservationIgnored private var suppressHudStateChatAppend: Bool = false
+    @ObservationIgnored private var speechAutoSendTask: Task<Void, Never>?
+    @ObservationIgnored private var lastTranscriptChangedAt: Date = .distantPast
+    @ObservationIgnored private var lastAutoSendIsFinal: Bool = false
+    @ObservationIgnored private var isStartingSpeechRecognition: Bool = false
+    @ObservationIgnored private var isUsingSidecarAudioFallback: Bool = false
+    @ObservationIgnored private var pendingFallbackUserTranscript: String = ""
+    @ObservationIgnored private var lastPlaybackEndedAt: Date = .distantPast
+    @ObservationIgnored private var lastAssistantTranscriptAt: Date = .distantPast
+    @ObservationIgnored private var recentAssistantNormalizedText: String = ""
+    @ObservationIgnored private var audioChunkContinuation: AsyncStream<Data>.Continuation?
+    @ObservationIgnored private var audioSendTask: Task<Void, Never>?
 
     public init(
         sidecarURL: URL = SidecarWebSocketClient.defaultURL,
@@ -62,6 +77,12 @@ public final class AppCoordinator {
         wireCallbacks()
     }
 
+    deinit {
+        speechAutoSendTask?.cancel()
+        audioSendTask?.cancel()
+        audioChunkContinuation?.finish()
+    }
+
     /// Installs global `Control+Option` monitoring on app launch.
     public func bootstrap() {
         hotkeyManager.startMonitoring()
@@ -85,8 +106,21 @@ public final class AppCoordinator {
         offlineSpeechManager.stopImmediately()
         permissionsManager.refresh()
 
+        if permissionsManager.microphone == .denied {
+            hotkeyManager.syncSessionActive(false)
+            surfaceAudioErrorOnce("Microphone permission denied in System Settings > Privacy & Security.")
+            return
+        }
+
+        speechAutoSendTask?.cancel()
+        speechAutoSendTask = nil
         isSessionActive = true
         lastAppliedDictationText = ""
+        lastTranscriptChangedAt = .distantPast
+        lastAutoSendIsFinal = false
+        isStartingSpeechRecognition = true
+        isUsingSidecarAudioFallback = false
+        pendingFallbackUserTranscript = ""
         isStreamingAssistantTurn = false
         hotkeyManager.syncSessionActive(true)
         privacyFilter.startObserving()
@@ -101,30 +135,44 @@ public final class AppCoordinator {
 
         switch permissionsManager.microphone {
         case .granted:
-            startAudioCapture()
-            Task { @MainActor [weak self] in
-                guard let self, self.isSessionActive else { return }
-                await self.speechManager.start()
-                guard self.isSessionActive, let speechError = self.speechManager.lastError else { return }
-                self.surfaceSpeechErrorOnce(speechError)
+            if !privacyFilter.isPaused {
+                startAudioCapture()
+                guard isSessionActive else { return }
+                Task { @MainActor [weak self] in
+                    await self?.startSpeechRecognitionIfActive()
+                }
+            } else {
+                isStartingSpeechRecognition = false
             }
         case .notDetermined:
             Task { @MainActor [weak self] in
                 guard let self, self.isSessionActive else { return }
+                let app: NSApplication? = NSApp
+                app?.activate(ignoringOtherApps: true)
                 await self.permissionsManager.requestMicrophone()
                 guard self.isSessionActive else { return }
                 guard self.permissionsManager.microphone == .granted else {
+                    self.isStartingSpeechRecognition = false
                     self.surfaceAudioErrorOnce("Microphone permission denied in System Settings > Privacy & Security.")
+                    self.stopSession()
+                    return
+                }
+                guard !self.privacyFilter.isPaused else {
+                    self.isStartingSpeechRecognition = false
                     return
                 }
                 self.startAudioCapture()
-                await self.speechManager.start()
-                guard self.isSessionActive, let speechError = self.speechManager.lastError else { return }
-                self.surfaceSpeechErrorOnce(speechError)
+                guard self.isSessionActive else { return }
+                await self.startSpeechRecognitionIfActive()
             }
         case .denied:
+            isStartingSpeechRecognition = false
             surfaceAudioErrorOnce("Microphone permission denied in System Settings > Privacy & Security.")
+            stopSession()
+            return
         }
+
+        guard isSessionActive else { return }
 
         captureEngine.startSessionCapture(interval: 1.0) { [weak self] contextMessage in
             await self?.sendScreenContextIfConnected(contextMessage)
@@ -140,6 +188,7 @@ public final class AppCoordinator {
             try audioManager.start()
         } catch {
             surfaceAudioErrorOnce("Audio start failed: \(error.localizedDescription)")
+            stopSession()
         }
     }
 
@@ -147,8 +196,18 @@ public final class AppCoordinator {
     public func stopSession() {
         guard isSessionActive else { return }
 
+        speechAutoSendTask?.cancel()
+        speechAutoSendTask = nil
+        let pendingDictatedPrompt = flushableDictatedPrompt()
+        let pendingFallbackPrompt = pendingFallbackUserTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+        pendingFallbackUserTranscript = ""
+
         isSessionActive = false
+        isStartingSpeechRecognition = false
+        isUsingSidecarAudioFallback = false
         lastAppliedDictationText = ""
+        lastTranscriptChangedAt = .distantPast
+        lastAutoSendIsFinal = false
         isStreamingAssistantTurn = false
         hotkeyManager.syncSessionActive(false)
         captureEngine.stopSessionCapture()
@@ -165,6 +224,13 @@ public final class AppCoordinator {
         overlayStore.clearAll()
         overlayStore.apply(HudStateMessage(state: .idle, transcriptSnippet: nil))
         overlayController.hideOverlay()
+
+        if let pendingDictatedPrompt {
+            sendTextPrompt(pendingDictatedPrompt)
+        } else if !pendingFallbackPrompt.isEmpty {
+            overlayStore.dictationText = ""
+            overlayStore.appendChatMessage(isUser: true, text: pendingFallbackPrompt)
+        }
     }
 
     /// Sends a typed or dictated prompt from the `Ask Parhlo…` input bar over `TextUpMessage`.
@@ -172,8 +238,14 @@ public final class AppCoordinator {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
+        speechAutoSendTask?.cancel()
+        speechAutoSendTask = nil
         overlayStore.dictationText = ""
         lastAppliedDictationText = ""
+        lastTranscriptChangedAt = .distantPast
+        lastAutoSendIsFinal = false
+        pendingFallbackUserTranscript = ""
+        speechManager.resetTranscript()
         isStreamingAssistantTurn = false
         overlayStore.appendChatMessage(isUser: true, text: trimmed)
 
@@ -244,29 +316,61 @@ public final class AppCoordinator {
             }
         }
 
-        audioManager.onAudioChunk = { [weak self] pcm16kData in
-            let b64 = pcm16kData.base64EncodedString()
+        webSocketClient.onInputTranscript = { [weak self] message in
             Task { @MainActor [weak self] in
+                self?.handleFallbackInputTranscript(message)
+            }
+        }
+
+        let (audioStream, audioContinuation) = AsyncStream<Data>.makeStream(bufferingPolicy: .bufferingNewest(64))
+        self.audioChunkContinuation = audioContinuation
+        self.audioSendTask = Task { @MainActor [weak self] in
+            for await pcm16kData in audioStream {
+                guard !Task.isCancelled else { break }
                 guard let self,
                       self.isSessionActive,
+                      !self.privacyFilter.isPaused,
+                      !self.isStartingSpeechRecognition,
+                      self.isUsingSidecarAudioFallback,
                       self.webSocketClient.connectionState == .connected else {
-                    return
+                    continue
                 }
+                let b64 = pcm16kData.base64EncodedString()
                 try? await self.webSocketClient.send(AudioUpMessage(pcmB64: b64))
             }
+        }
+
+        audioManager.onAudioChunk = { pcm16kData in
+            audioContinuation.yield(pcm16kData)
         }
 
         audioManager.onRawAudioBuffer = { [weak speech = self.speechManager] buffer in
             speech?.appendAudioBuffer(buffer)
         }
 
-        speechManager.onTranscriptUpdate = { [weak self] transcript, _ in
+        audioManager.onSpeechEnergyDetected = { [weak self] _ in
+            self?.extendSpeechAutoSendOnActiveSpeechIfNeeded()
+        }
+
+        audioManager.onPlaybackStateChanged = { [weak self] isPlaying in
+            guard let self else { return }
+            if !isPlaying {
+                self.lastPlaybackEndedAt = Date()
+            }
+            if self.isSessionActive,
+               self.overlayStore.dictationText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                self.speechManager.resetTranscript()
+            }
+        }
+
+        speechManager.onTranscriptUpdate = { [weak self] transcript, isFinal in
             guard let self, self.isSessionActive else { return }
-            self.applyLiveDictationTranscript(transcript)
+            self.handleLiveSpeechTranscript(transcript, isFinal: isFinal)
         }
 
         speechManager.onError = { [weak self] message in
             guard let self, self.isSessionActive else { return }
+            self.isUsingSidecarAudioFallback = true
             self.surfaceSpeechErrorOnce(message)
         }
 
@@ -277,13 +381,31 @@ public final class AppCoordinator {
         audioManager.onLocalVoiceActivity = { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self, self.isSessionActive else { return }
+                self.isStreamingAssistantTurn = false
                 self.audioManager.stopPlaybackImmediately()
+                self.overlayStore.handleBargeIn(BargeInMessage(reason: .vadInterrupted))
+                if self.webSocketClient.connectionState == .connected {
+                    try? await self.webSocketClient.send(SessionControlMessage(action: .bargeInManual))
+                }
             }
         }
 
         audioManager.onError = { [weak self] message in
             Task { @MainActor [weak self] in
-                self?.surfaceAudioErrorOnce("Audio start failed: \(message)")
+                guard let self else { return }
+                self.surfaceAudioErrorOnce("Audio start failed: \(message)")
+                if self.isSessionActive {
+                    self.stopSession()
+                }
+            }
+        }
+
+        privacyFilter.onPauseStateChanged = { [weak self] isPaused, _ in
+            guard let self, self.isSessionActive else { return }
+            if isPaused {
+                self.pauseCaptureForPrivacy()
+            } else {
+                self.resumeCaptureAfterPrivacy()
             }
         }
 
@@ -313,7 +435,7 @@ public final class AppCoordinator {
         for _ in 0..<20 {
             if webSocketClient.connectionState == .connected {
                 do {
-                    if !isSessionActive && !privacyFilter.isPaused {
+                    if (!isSessionActive || captureEngine.lastCaptureDate == nil) && !privacyFilter.isPaused {
                         if let screenContext = try? await captureEngine.captureOnce(respectRateLimit: false) {
                             overlayController.showOverlay()
                             overlayStore.triggerCapturePulse()
@@ -372,6 +494,8 @@ public final class AppCoordinator {
             guard !trimmed.isEmpty else { return }
             isStreamingAssistantTurn = false
             overlayStore.appendChatMessage(isUser: false, text: trimmed)
+            suppressHudStateChatAppend = true
+            defer { suppressHudStateChatAppend = false }
             overlayStore.apply(HudStateMessage(state: isSessionActive ? .listening : .idle, transcriptSnippet: trimmed))
             if !isSessionActive {
                 offlineSpeechManager.speak(trimmed, muted: audioManager.isOutputMuted)
@@ -380,11 +504,12 @@ public final class AppCoordinator {
             let fallback = "Offline assistant unavailable: \(error.localizedDescription)"
             lastStatusError = fallback
             overlayStore.appendChatMessage(isUser: false, text: fallback)
-            overlayStore.apply(HudStateMessage(state: .idle, transcriptSnippet: nil))
+            overlayStore.apply(HudStateMessage(state: isSessionActive ? .listening : .idle, transcriptSnippet: nil))
         }
     }
 
     private func handleAppliedHudState(_ message: HudStateMessage) {
+        guard !suppressHudStateChatAppend else { return }
         guard let rawSnippet = message.transcriptSnippet else { return }
         let snippet = rawSnippet.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !snippet.isEmpty else { return }
@@ -402,11 +527,16 @@ public final class AppCoordinator {
         guard isAssistantTranscript || isSidecarError else { return }
 
         if isAssistantTranscript {
+            commitPendingFallbackUserTranscriptIfNeeded()
             if isStreamingAssistantTurn {
                 overlayStore.appendToLastAssistantMessage(rawSnippet)
             } else {
                 isStreamingAssistantTurn = true
                 overlayStore.appendChatMessage(isUser: false, text: snippet)
+            }
+            if let latestAssistant = overlayStore.messages.last, !latestAssistant.isUser {
+                recentAssistantNormalizedText = Self.normalizedEchoComparisonText(latestAssistant.text)
+                lastAssistantTranscriptAt = Date()
             }
         } else {
             isStreamingAssistantTurn = false
@@ -425,6 +555,145 @@ public final class AppCoordinator {
         lastAppliedDictationText = transcript
     }
 
+    /// Applies a live speech update into the input field and schedules auto-send when speech stops.
+    public func handleLiveSpeechTranscript(_ transcript: String, isFinal: Bool) {
+        guard !audioManager.isPlayingAudio else { return }
+
+        let latestAssistantActivity = max(lastPlaybackEndedAt, lastAssistantTranscriptAt)
+        if Self.isLikelyAssistantEcho(
+            transcript: transcript,
+            recentAssistantText: recentAssistantNormalizedText,
+            lastAssistantActivityAt: latestAssistantActivity
+        ) {
+            if overlayStore.dictationText == lastAppliedDictationText {
+                overlayStore.dictationText = ""
+                lastAppliedDictationText = ""
+                speechAutoSendTask?.cancel()
+                speechAutoSendTask = nil
+                speechManager.resetTranscript()
+            }
+            return
+        }
+
+        let previousApplied = lastAppliedDictationText
+        applyLiveDictationTranscript(transcript)
+
+        guard let _ = flushableDictatedPrompt() else {
+            speechAutoSendTask?.cancel()
+            speechAutoSendTask = nil
+            return
+        }
+
+        if lastAppliedDictationText != previousApplied || lastTranscriptChangedAt == .distantPast {
+            lastTranscriptChangedAt = Date()
+        }
+        scheduleSpeechAutoSend(isFinal: isFinal)
+    }
+
+    private func scheduleSpeechAutoSend(isFinal: Bool) {
+        speechAutoSendTask?.cancel()
+        lastAutoSendIsFinal = isFinal
+        let delay = max(0.0, isFinal ? finalTranscriptAutoSendDelay : speechStopAutoSendDelay)
+        speechAutoSendTask = Task { @MainActor [weak self] in
+            if delay > 0 {
+                try? await Task.sleep(for: .milliseconds(Int(delay * 1000)))
+            }
+            guard let self, !Task.isCancelled else { return }
+            self.speechAutoSendTask = nil
+            guard self.isSessionActive, !self.privacyFilter.isPaused else { return }
+            self.flushDictatedPromptIfReady()
+        }
+    }
+
+    private func extendSpeechAutoSendOnActiveSpeechIfNeeded() {
+        guard isSessionActive,
+              !privacyFilter.isPaused,
+              speechAutoSendTask != nil,
+              !lastAutoSendIsFinal,
+              flushableDictatedPrompt() != nil else {
+            return
+        }
+        let elapsedSinceChange = Date().timeIntervalSince(lastTranscriptChangedAt)
+        guard elapsedSinceChange < maxSpeechEnergyExtensionDelay else {
+            return
+        }
+        scheduleSpeechAutoSend(isFinal: false)
+    }
+
+    private func flushableDictatedPrompt() -> String? {
+        let trimmed = overlayStore.dictationText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              !lastAppliedDictationText.isEmpty,
+              overlayStore.dictationText == lastAppliedDictationText else {
+            return nil
+        }
+        return trimmed
+    }
+
+    private func flushDictatedPromptIfReady() {
+        guard let prompt = flushableDictatedPrompt() else { return }
+        sendTextPrompt(prompt)
+    }
+
+    private func startSpeechRecognitionIfActive() async {
+        guard isSessionActive, !privacyFilter.isPaused else {
+            isStartingSpeechRecognition = false
+            return
+        }
+        isStartingSpeechRecognition = true
+        if permissionsManager.speechRecognition == .notDetermined {
+            let app: NSApplication? = NSApp
+            app?.activate(ignoringOtherApps: true)
+        }
+        await speechManager.start()
+        permissionsManager.refresh()
+        isStartingSpeechRecognition = false
+        guard isSessionActive else { return }
+        if !speechManager.isListening {
+            isUsingSidecarAudioFallback = true
+            if let speechError = speechManager.lastError {
+                surfaceSpeechErrorOnce(speechError)
+            }
+        } else {
+            isUsingSidecarAudioFallback = false
+        }
+    }
+
+    private func handleFallbackInputTranscript(_ message: InputTranscriptMessage) {
+        guard isSessionActive, isUsingSidecarAudioFallback else { return }
+        let trimmed = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            if message.isFinal {
+                commitPendingFallbackUserTranscriptIfNeeded()
+            }
+            return
+        }
+
+        if pendingFallbackUserTranscript.isEmpty {
+            pendingFallbackUserTranscript = trimmed
+        } else if !pendingFallbackUserTranscript.hasSuffix(trimmed) {
+            let separator = message.text.first?.isWhitespace == true || pendingFallbackUserTranscript.last?.isWhitespace == true ? " " : " "
+            pendingFallbackUserTranscript += separator + trimmed
+        }
+        applyLiveDictationTranscript(pendingFallbackUserTranscript)
+
+        if message.isFinal {
+            commitPendingFallbackUserTranscriptIfNeeded()
+        }
+    }
+
+    private func commitPendingFallbackUserTranscriptIfNeeded() {
+        let committed = pendingFallbackUserTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !committed.isEmpty else { return }
+        pendingFallbackUserTranscript = ""
+        if overlayStore.dictationText == lastAppliedDictationText {
+            overlayStore.dictationText = ""
+            lastAppliedDictationText = ""
+        }
+        isStreamingAssistantTurn = false
+        overlayStore.appendChatMessage(isUser: true, text: committed)
+    }
+
     private func surfaceSpeechErrorOnce(_ message: String) {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, lastSurfacedSpeechError != trimmed else { return }
@@ -439,6 +708,85 @@ public final class AppCoordinator {
         lastSurfacedAudioError = trimmed
         lastStatusError = trimmed
         overlayStore.appendChatMessage(isUser: false, text: trimmed)
+    }
+
+    private func pauseCaptureForPrivacy() {
+        speechAutoSendTask?.cancel()
+        speechAutoSendTask = nil
+        isStartingSpeechRecognition = false
+        isStreamingAssistantTurn = false
+        speechManager.stop()
+        offlineSpeechManager.stopImmediately()
+        audioManager.stopPlaybackImmediately()
+        audioManager.stop()
+    }
+
+    private func resumeCaptureAfterPrivacy() {
+        guard isSessionActive, !privacyFilter.isPaused else { return }
+        permissionsManager.refresh()
+
+        switch permissionsManager.microphone {
+        case .granted:
+            startAudioCapture()
+            guard isSessionActive else { return }
+            Task { @MainActor [weak self] in
+                await self?.startSpeechRecognitionIfActive()
+            }
+        case .notDetermined:
+            Task { @MainActor [weak self] in
+                guard let self, self.isSessionActive, !self.privacyFilter.isPaused else { return }
+                let app: NSApplication? = NSApp
+                app?.activate(ignoringOtherApps: true)
+                await self.permissionsManager.requestMicrophone()
+                guard self.isSessionActive, !self.privacyFilter.isPaused else { return }
+                guard self.permissionsManager.microphone == .granted else {
+                    self.surfaceAudioErrorOnce("Microphone permission denied in System Settings > Privacy & Security.")
+                    self.stopSession()
+                    return
+                }
+                self.startAudioCapture()
+                guard self.isSessionActive else { return }
+                await self.startSpeechRecognitionIfActive()
+            }
+        case .denied:
+            surfaceAudioErrorOnce("Microphone permission denied in System Settings > Privacy & Security.")
+            stopSession()
+            return
+        }
+
+        if isSessionActive && !privacyFilter.isPaused && overlayStore.hudState != .listening {
+            overlayStore.apply(HudStateMessage(
+                state: .listening,
+                transcriptSnippet: "Listening… (Control+Option to stop)"
+            ))
+        }
+    }
+
+    nonisolated internal static func normalizedEchoComparisonText(_ text: String) -> String {
+        text
+            .lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
+    nonisolated internal static func isLikelyAssistantEcho(
+        transcript: String,
+        recentAssistantText: String,
+        lastAssistantActivityAt: Date,
+        now: Date = Date()
+    ) -> Bool {
+        guard lastAssistantActivityAt != .distantPast,
+              now.timeIntervalSince(lastAssistantActivityAt) <= 2.5,
+              !recentAssistantText.isEmpty else {
+            return false
+        }
+        let normalizedTranscript = normalizedEchoComparisonText(transcript)
+        let wordCount = normalizedTranscript.split(separator: " ").count
+        guard normalizedTranscript.count >= 6 || wordCount >= 2 else {
+            return false
+        }
+        return recentAssistantText.contains(normalizedTranscript)
     }
 
     private func sendScreenContextIfConnected(_ message: ScreenContextMessage) async {

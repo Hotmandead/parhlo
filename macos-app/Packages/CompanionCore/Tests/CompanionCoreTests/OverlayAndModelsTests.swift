@@ -96,4 +96,90 @@ struct OverlayAndModelsTests {
         #expect(window.canBecomeKey == false)
         #expect(window.canBecomeMain == false)
     }
+
+    @Test("CoordinateConverter converts global Quartz rects to display-local rects and clamps points")
+    func displayLocalCoordinateHelpers() {
+        let displayBounds = CGRect(x: 1728, y: 120, width: 1440, height: 900)
+        let globalRect = CGRect(x: 1928, y: 270, width: 200, height: 48)
+        let local = CoordinateConverter.toDisplayLocalRect(globalRect, displayBounds: displayBounds)
+        #expect(local == CGRect(x: 200, y: 150, width: 200, height: 48))
+
+        let clamped = CoordinateConverter.clampedPoint(
+            CGPoint(x: -30, y: 1200),
+            in: CGSize(width: 1440, height: 900),
+            inset: 12
+        )
+        #expect(clamped == CGPoint(x: 12, y: 888))
+    }
+
+    @Test("VectorAnnotationNSView synthesizes arrow start when fromPoint is nil, supports spotlight pulse, renders labels, and rebuilds updated commandId")
+    @MainActor
+    func vectorAnnotationRenderingAndUpdates() {
+        let canvasSize = CGSize(width: 1440, height: 900)
+        let synthesized = VectorAnnotationNSView.resolvedArrowStartPoint(
+            from: nil,
+            to: Point2D(x: 500, y: 400),
+            canvasSize: canvasSize
+        )
+        #expect(synthesized == Point2D(x: 460, y: 360))
+
+        let cornerSynthesized = VectorAnnotationNSView.resolvedArrowStartPoint(
+            from: nil,
+            to: Point2D(x: 10, y: 10),
+            canvasSize: canvasSize
+        )
+        #expect(cornerSynthesized == Point2D(x: 50, y: 50))
+        #expect(cornerSynthesized != Point2D(x: 10, y: 10))
+
+        #expect(VectorAnnotationNSView.shouldShowPulseRing(style: "pulse") == true)
+        #expect(VectorAnnotationNSView.shouldShowPulseRing(style: "spotlight") == true)
+        #expect(VectorAnnotationNSView.shouldShowPulseRing(style: " Spotlight ") == true)
+        #expect(VectorAnnotationNSView.shouldShowPulseRing(style: "solid") == false)
+
+        let view = VectorAnnotationNSView(frame: NSRect(origin: .zero, size: canvasSize))
+        let highlight1 = DrawCommandMessage(
+            commandId: "hl-1",
+            action: .highlightRegion,
+            pixelRect: PixelRect(x: 100, y: 120, width: 200, height: 48),
+            label: "Run Button",
+            color: "#3B82F6",
+            style: "spotlight"
+        )
+        let arrowNoFrom = DrawCommandMessage(
+            commandId: "arr-1",
+            action: .pointArrow,
+            fromPoint: nil,
+            toPoint: Point2D(x: 600, y: 300),
+            label: "Click here",
+            color: "#10B981"
+        )
+
+        view.update(highlights: [highlight1], arrows: [arrowNoFrom])
+
+        let initialHighlightLayer = view.annotationLayers["hl-1"]
+        let initialArrowLayer = view.annotationLayers["arr-1"]
+        #expect(initialHighlightLayer != nil)
+        #expect(initialArrowLayer != nil)
+        // Highlight with "spotlight" + label creates pulse layer + box layer + label pill layer.
+        #expect((initialHighlightLayer?.sublayers?.count ?? 0) == 3)
+        // Arrow without explicit fromPoint still renders shaft + head + label pill layer.
+        #expect((initialArrowLayer?.sublayers?.count ?? 0) == 3)
+
+        // Updating the same commandId with modified pixelRect must rebuild the layer instead of skipping.
+        let highlight1Updated = DrawCommandMessage(
+            commandId: "hl-1",
+            action: .highlightRegion,
+            pixelRect: PixelRect(x: 320, y: 240, width: 260, height: 56),
+            label: "Run Button Updated",
+            color: "#EF4444",
+            style: "pulse"
+        )
+        view.update(highlights: [highlight1Updated], arrows: [arrowNoFrom])
+
+        let rebuiltHighlightLayer = view.annotationLayers["hl-1"]
+        let unchangedArrowLayer = view.annotationLayers["arr-1"]
+        #expect(rebuiltHighlightLayer != nil)
+        #expect(rebuiltHighlightLayer !== initialHighlightLayer)
+        #expect(unchangedArrowLayer === initialArrowLayer)
+    }
 }

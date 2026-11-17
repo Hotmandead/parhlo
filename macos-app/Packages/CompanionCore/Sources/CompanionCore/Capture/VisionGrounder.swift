@@ -1,4 +1,5 @@
 import CoreGraphics
+import CoreML
 import Foundation
 import Vision
 
@@ -26,6 +27,12 @@ public actor VisionGrounder {
             request.minimumSize = 0.02
             request.minimumConfidence = 0.6
             request.maximumObservations = max(1, min(40, maxCount))
+            if let cpuDevice = MLComputeDevice.allComputeDevices.first(where: { device in
+                if case .cpu = device { return true }
+                return false
+            }) {
+                request.setComputeDevice(cpuDevice, for: .main)
+            }
 
             let handler = VNImageRequestHandler(cgImage: image, options: [:])
             do {
@@ -75,17 +82,27 @@ public actor VisionGrounder {
         }.value
     }
 
-    /// Extracts structured, privacy-redacted document context from `image` using macOS 26
-    /// `RecognizeDocumentsRequest`, falling back to redacted OCR lines when unavailable or empty.
+    /// Extracts structured, privacy-redacted document context from `image` using sanitized OCR lines by default
+    /// (avoiding redundant full-frame Vision passes and E5 ANE bundle warnings), or macOS 26
+    /// `RecognizeDocumentsRequest` when `useStructuredVisionRequest` is explicitly enabled.
     public func extractDocumentContext(
         from image: CGImage,
         redactor: VisionRedactor,
         fallbackText: String = "",
-        maxTotalChars: Int = 4000
+        maxTotalChars: Int = 4000,
+        useStructuredVisionRequest: Bool = false
     ) async -> DocumentContext? {
         let charBudget = max(1, maxTotalChars)
 
-        if #available(macOS 26.0, *) {
+        if !fallbackText.isEmpty && !useStructuredVisionRequest {
+            return Self.buildFallbackContext(
+                from: fallbackText,
+                redactor: redactor,
+                maxTotalChars: charBudget
+            )
+        }
+
+        if useStructuredVisionRequest, #available(macOS 26.0, *) {
             if let structured = await recognizeStructuredDocument(
                 from: image,
                 redactor: redactor,
@@ -111,6 +128,8 @@ public actor VisionGrounder {
     ) async -> DocumentContext? {
         var request = RecognizeDocumentsRequest()
         request.textRecognitionOptions.useLanguageCorrection = false
+        request.textRecognitionOptions.automaticallyDetectLanguage = false
+        request.textRecognitionOptions.recognitionLanguages = [Locale.Language(identifier: "en-US")]
 
         let observations: [DocumentObservation]
         do {

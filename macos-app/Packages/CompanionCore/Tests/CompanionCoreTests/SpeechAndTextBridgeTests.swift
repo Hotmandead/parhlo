@@ -146,8 +146,8 @@ struct SpeechAndTextBridgeTests {
         if let channels = multiBuffer.floatChannelData {
             for frame in 0..<512 {
                 channels[0][frame] = 0.25
-                channels[1][frame] = 0.25
-                channels[2][frame] = 0.25
+                channels[1][frame] = 0.0
+                channels[2][frame] = 0.0
             }
         }
 
@@ -158,7 +158,150 @@ struct SpeechAndTextBridgeTests {
         ))
         #expect(normalized.format.channelCount == 1)
         #expect(normalized.format.commonFormat == .pcmFormatFloat32)
-        #expect(normalized.frameLength > 0)
+        #expect(normalized.frameLength == 512)
+        let normalizedSamples = try #require(normalized.floatChannelData?[0])
+        #expect(abs(normalizedSamples[0] - 0.25) < 0.001)
+        #expect(abs(normalizedSamples[511] - 0.25) < 0.001)
+
+        // When channel 0 is silent on an aggregate device and channel 1 carries mic audio, channel 1 is selected.
+        if let channels = multiBuffer.floatChannelData {
+            for frame in 0..<512 {
+                channels[0][frame] = 0.0
+                channels[1][frame] = -0.35
+                channels[2][frame] = 0.0
+            }
+        }
+        let channel1Normalized = try #require(SpeechRecognitionManager.normalizeBufferForSpeech(
+            multiBuffer,
+            cachedConverter: &converter,
+            cachedSourceFormat: &sourceFormat
+        ))
+        let channel1Samples = try #require(channel1Normalized.floatChannelData?[0])
+        #expect(abs(channel1Samples[0] - (-0.35)) < 0.001)
+    }
+
+    @Test("InputTranscriptMessage JSON round-trip matches DownstreamEvent schema")
+    func inputTranscriptDownstreamDecoding() throws {
+        let json = """
+        {"type":"input_transcript","text":"Hello, how are you?","is_final":true}
+        """
+        let event = try JSONDecoder().decode(DownstreamEvent.self, from: Data(json.utf8))
+        #expect(event == .inputTranscript(InputTranscriptMessage(text: "Hello, how are you?", isFinal: true)))
+
+        let encoded = try JSONEncoder().encode(event)
+        let dict = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        #expect(dict["type"] as? String == "input_transcript")
+        #expect(dict["text"] as? String == "Hello, how are you?")
+        #expect(dict["is_final"] as? Bool == true)
+    }
+
+    @Test("Live speech populates input field and auto-sends to chat when speech stops")
+    @MainActor
+    func liveSpeechPopulatesInputAndAutoSendsOnSpeechStop() async {
+        struct StubOfflineQA: OfflineQASession {
+            func answer(prompt: String, context: OfflineScreenContext) async throws -> String {
+                "Received: \(prompt)"
+            }
+        }
+
+        let store = OverlayStateStore()
+        let coordinator = AppCoordinator(
+            sidecarURL: URL(string: "ws://127.0.0.1:1")!,
+            overlayStore: store,
+            offlineEngine: StubOfflineQA()
+        )
+        coordinator.backendMode = .offlineOnly
+        coordinator.setOutputMuted(true)
+        coordinator.speechStopAutoSendDelay = 0.08
+        coordinator.finalTranscriptAutoSendDelay = 0.03
+        coordinator.isSessionActive = true
+        let initialCount = store.messages.count
+
+        // Partial results populate the input box without sending prematurely.
+        coordinator.handleLiveSpeechTranscript("Hello", isFinal: false)
+        #expect(store.dictationText == "Hello")
+        #expect(store.messages.count == initialCount)
+
+        try? await Task.sleep(for: .milliseconds(30))
+        coordinator.handleLiveSpeechTranscript("Hello, how are you?", isFinal: false)
+        #expect(store.dictationText == "Hello, how are you?")
+        #expect(store.messages.count == initialCount)
+
+        // After speech stops (beyond 80ms delay), dictated input clears and sends to chat.
+        try? await Task.sleep(for: .milliseconds(160))
+        #expect(store.dictationText == "")
+        let userMessages = store.messages.filter { $0.isUser }
+        #expect(userMessages.last?.text == "Hello, how are you?")
+
+        // Manual edit while focused must NOT auto-send.
+        store.isEditingPrompt = true
+        coordinator.handleLiveSpeechTranscript("Draft question", isFinal: false)
+        #expect(store.dictationText == "Draft question")
+        store.dictationText = "Draft question edited manually"
+        coordinator.handleLiveSpeechTranscript("Ignored update", isFinal: false)
+        try? await Task.sleep(for: .milliseconds(140))
+        #expect(store.dictationText == "Draft question edited manually")
+        #expect(store.messages.filter { $0.isUser }.count == userMessages.count)
+
+        // Stopping session flushes pending unedited dictation prompt immediately.
+        store.dictationText = ""
+        store.isEditingPrompt = false
+        coordinator.handleLiveSpeechTranscript("Send on stop", isFinal: false)
+        #expect(store.dictationText == "Send on stop")
+        coordinator.stopSession()
+        #expect(store.dictationText == "")
+        #expect(store.messages.filter { $0.isUser }.last?.text == "Send on stop")
+
+        coordinator.webSocketClient.disconnect()
+    }
+
+    @Test("AppCoordinator filters recent assistant output echo from speech dictation")
+    @MainActor
+    func assistantOutputEchoIsFiltered() throws {
+        let now = Date()
+        let assistantNorm = AppCoordinator.normalizedEchoComparisonText("Hello, I'm doing great, thank you. How can I assist you today?")
+        #expect(
+            AppCoordinator.isLikelyAssistantEcho(
+                transcript: "I'm doing great, thank you",
+                recentAssistantText: assistantNorm,
+                lastAssistantActivityAt: now.addingTimeInterval(-0.6),
+                now: now
+            ) == true
+        )
+        #expect(
+            AppCoordinator.isLikelyAssistantEcho(
+                transcript: "Where is the export button?",
+                recentAssistantText: assistantNorm,
+                lastAssistantActivityAt: now.addingTimeInterval(-0.6),
+                now: now
+            ) == false
+        )
+        #expect(
+            AppCoordinator.isLikelyAssistantEcho(
+                transcript: "I'm doing great, thank you",
+                recentAssistantText: assistantNorm,
+                lastAssistantActivityAt: now.addingTimeInterval(-4.0),
+                now: now
+            ) == false
+        )
+
+        let store = OverlayStateStore()
+        let coordinator = AppCoordinator(
+            sidecarURL: URL(string: "ws://127.0.0.1:1")!,
+            overlayStore: store
+        )
+        coordinator.isSessionActive = true
+        try coordinator.webSocketClient.handleIncomingText(
+            #"{"type":"hud_state","state":"listening","transcript_snippet":"Hello, I am doing great today."}"#
+        )
+        coordinator.handleLiveSpeechTranscript("I am doing great", isFinal: false)
+        #expect(store.dictationText == "")
+
+        coordinator.handleLiveSpeechTranscript("Explain this Xcode error", isFinal: false)
+        #expect(store.dictationText == "Explain this Xcode error")
+
+        coordinator.isSessionActive = false
+        coordinator.webSocketClient.disconnect()
     }
 
     @Test("AppCoordinator surfaces audio and speech error callbacks into overlayStore")
@@ -183,6 +326,54 @@ struct SpeechAndTextBridgeTests {
         try? await Task.sleep(for: .milliseconds(50))
         #expect(store.messages.count == initialCount + 1)
 
+        coordinator.webSocketClient.disconnect()
+    }
+
+    @Test("SpeechRecognitionManager.resetTranscript clears transcript state")
+    @MainActor
+    func speechManagerResetTranscriptClearsState() {
+        let manager = SpeechRecognitionManager()
+        manager.resetTranscript()
+        #expect(manager.latestTranscript == "")
+        #expect(manager.isListening == false)
+    }
+
+    @Test("AppCoordinator.runOfflineFallback does not duplicate assistant reply when session is active")
+    @MainActor
+    func offlineFallbackDoesNotDuplicateChatWhenSessionActive() async {
+        struct StubOfflineQA: OfflineQASession {
+            func answer(prompt: String, context: OfflineScreenContext) async throws -> String {
+                "Click the Export button in the top-right toolbar."
+            }
+        }
+
+        let store = OverlayStateStore()
+        let coordinator = AppCoordinator(
+            sidecarURL: URL(string: "ws://127.0.0.1:1")!,
+            overlayStore: store,
+            offlineEngine: StubOfflineQA()
+        )
+        coordinator.privacyFilter.addExcludedBundleID(
+            Bundle.main.bundleIdentifier ?? "com.apple.dt.xctest.tool"
+        )
+        coordinator.privacyFilter.evaluateFrontmostApplication(
+            bundleIdentifier: Bundle.main.bundleIdentifier ?? "com.apple.dt.xctest.tool",
+            appName: "TestRunner"
+        )
+        coordinator.isSessionActive = true
+        let initialCount = store.messages.count
+
+        await coordinator.runOfflineFallback(for: "Where is export?")
+
+        let matching = store.messages.filter {
+            !$0.isUser && $0.text == "Click the Export button in the top-right toolbar."
+        }
+        #expect(matching.count == 1)
+        #expect(store.messages.count == initialCount + 1)
+        #expect(store.hudState == .listening)
+        #expect(store.transcriptSnippet == "Click the Export button in the top-right toolbar.")
+
+        coordinator.isSessionActive = false
         coordinator.webSocketClient.disconnect()
     }
 }

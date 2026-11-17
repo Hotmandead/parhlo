@@ -149,6 +149,35 @@ struct CaptureAndBridgeTests {
         #expect(store.hudState == .listening)
     }
 
+    @Test("PrivacyFilter preserves active privacy pause when Parhlo itself activates")
+    @MainActor
+    func privacyFilterPreservesPauseOnSelfActivation() {
+        let store = OverlayStateStore()
+        store.apply(HudStateMessage(state: .listening, transcriptSnippet: "Listening"))
+        let filter = PrivacyFilter(
+            overlayStore: store,
+            ownBundleID: "com.parhlo.ScreenCompanionApp"
+        )
+
+        filter.evaluateFrontmostApplication(bundleIdentifier: "com.1password.1password", appName: "1Password")
+        #expect(filter.isPaused == true)
+        #expect(store.hudState == .privacyPaused)
+        #expect(filter.lastExternalBundleID == "com.1password.1password")
+
+        // Clicking Parhlo's own drawer or settings must NOT un-pause while 1Password is behind it.
+        filter.evaluateFrontmostApplication(bundleIdentifier: "com.parhlo.ScreenCompanionApp", appName: "Parhlo")
+        #expect(filter.isPaused == true)
+        #expect(store.hudState == .privacyPaused)
+        #expect(filter.frontmostBundleID == "com.1password.1password")
+        #expect(filter.lastExternalBundleID == "com.1password.1password")
+
+        // Switching to a non-excluded external app resumes capture.
+        filter.evaluateFrontmostApplication(bundleIdentifier: "com.apple.Safari", appName: "Safari")
+        #expect(filter.isPaused == false)
+        #expect(store.hudState == .listening)
+        #expect(filter.lastExternalBundleID == "com.apple.Safari")
+    }
+
     // MARK: - VisionRedactor
 
     @Test("VisionRedactor detects sensitive text patterns and custom regexes")
@@ -218,6 +247,153 @@ struct CaptureAndBridgeTests {
         let truncated = AXInspector.sanitizeText(longText, maxLength: 40, redactor: redactor)
         #expect(truncated?.count == 40)
         #expect(truncated?.hasSuffix("…") == true)
+    }
+
+    @Test("AXInspector.displayLocalRect subtracts non-zero screenBounds origin and preserves coordinates when nil")
+    func axInspectorDisplayLocalCoordinateConversion() {
+        let secondaryScreen = CGRect(x: 1728, y: 120, width: 1440, height: 900)
+        let globalButton = CGRect(x: 1848, y: 260, width: 160, height: 36)
+
+        let local = AXInspector.displayLocalRect(globalButton, within: secondaryScreen)
+        #expect(local?.x == 120)
+        #expect(local?.y == 140)
+        #expect(local?.width == 160)
+        #expect(local?.height == 36)
+
+        let offScreen = CGRect(x: 100, y: 100, width: 120, height: 32)
+        #expect(AXInspector.displayLocalRect(offScreen, within: secondaryScreen) == nil)
+
+        let withoutBounds = AXInspector.displayLocalRect(globalButton, within: nil)
+        #expect(withoutBounds?.x == 1848)
+        #expect(withoutBounds?.y == 260)
+    }
+
+    @Test("CaptureEngine shares custom VisionRedactor with default AXInspector and selects matching display")
+    @MainActor
+    func captureEngineRedactorSharingAndDisplaySelection() {
+        let customRedactor = VisionRedactor(customPatterns: [#"SECRET-TOKEN-\d{4}"#])
+        let filter = PrivacyFilter(ownBundleID: "com.parhlo.ScreenCompanionApp")
+        let engine = CaptureEngine(
+            privacyFilter: filter,
+            redactor: customRedactor,
+            ownBundleID: "com.parhlo.ScreenCompanionApp",
+            ownPID: 4242
+        )
+
+        #expect(engine.axInspector.redactor === customRedactor)
+        #expect(
+            AXInspector.sanitizeText(
+                "Key: SECRET-TOKEN-9912",
+                redactor: engine.axInspector.redactor
+            ) == "[REDACTED]"
+        )
+
+        // Multi-display selection: frontmost window intersection > cursor display > main display > first.
+        let primaryID: CGDirectDisplayID = 1
+        let secondaryID: CGDirectDisplayID = 2
+        let displays: [(id: CGDirectDisplayID, frame: CGRect)] = [
+            (primaryID, CGRect(x: 0, y: 0, width: 1440, height: 900)),
+            (secondaryID, CGRect(x: 1440, y: 0, width: 1728, height: 1117)),
+        ]
+
+        let windowOnSecondary = CGRect(x: 1600, y: 100, width: 900, height: 700)
+        #expect(
+            CaptureEngine.selectDisplayID(
+                from: displays,
+                frontWindowFrame: windowOnSecondary,
+                cursorDisplayID: primaryID,
+                mainDisplayID: primaryID
+            ) == secondaryID
+        )
+        #expect(
+            CaptureEngine.selectDisplayID(
+                from: displays,
+                frontWindowFrame: nil,
+                cursorDisplayID: secondaryID,
+                mainDisplayID: primaryID
+            ) == secondaryID
+        )
+        #expect(
+            CaptureEngine.selectDisplayID(
+                from: displays,
+                frontWindowFrame: nil,
+                cursorDisplayID: nil,
+                mainDisplayID: secondaryID
+            ) == secondaryID
+        )
+    }
+
+    @Test("CaptureEngine never passes ownPID to AXInspector and enforces in-flight 1 FPS rate limit")
+    @MainActor
+    func captureEngineOwnPIDHandlingAndRateLimit() async throws {
+        let filter = PrivacyFilter(ownBundleID: "com.parhlo.ScreenCompanionApp")
+        let engine = CaptureEngine(
+            privacyFilter: filter,
+            ownBundleID: "com.parhlo.ScreenCompanionApp",
+            ownPID: 7777
+        )
+
+        // External app resolves to its own PID, then Parhlo self-activation never returns ownPID.
+        let externalTarget = try engine.resolveTargetApplication(
+            frontmostPID: 5555,
+            frontmostBundleID: "com.apple.Safari",
+            frontmostAppName: "Safari"
+        )
+        #expect(externalTarget.pid == 5555)
+
+        let selfTarget = try engine.resolveTargetApplication(
+            frontmostPID: 7777,
+            frontmostBundleID: "com.parhlo.ScreenCompanionApp",
+            frontmostAppName: "Parhlo"
+        )
+        #expect(selfTarget.pid != 7777)
+
+        // Concurrent captureOnce calls must not bypass the 1 FPS limit, and scaleFactor comes from snapshot.
+        let image = try #require(
+            renderTextImage(width: 320, height: 180, topLine: "Parhlo", bottomLine: "Rate Limit Test")
+        )
+        let invocationCount = LockedBuffer<Int>()
+        engine.snapshotProviderOverride = {
+            invocationCount.append(1)
+            try? await Task.sleep(for: .milliseconds(120))
+            return DisplayCaptureSnapshot(
+                image: image,
+                logicalWidth: 1728,
+                logicalHeight: 1117,
+                displayBounds: CGRect(x: 1440, y: 0, width: 1728, height: 1117),
+                scaleFactor: 2.0,
+                displayID: 2
+            )
+        }
+
+        async let firstCall: Result<ScreenContextMessage, Error> = {
+            do {
+                return .success(try await engine.captureOnce(respectRateLimit: true))
+            } catch {
+                return .failure(error)
+            }
+        }()
+        try? await Task.sleep(for: .milliseconds(20))
+        async let secondCall: Result<ScreenContextMessage, Error> = {
+            do {
+                return .success(try await engine.captureOnce(respectRateLimit: true))
+            } catch {
+                return .failure(error)
+            }
+        }()
+
+        let (firstResult, secondResult) = await (firstCall, secondCall)
+        let message = try firstResult.get()
+        #expect(message.scaleFactor == 2.0)
+        #expect(message.screenWidth == 1728)
+        #expect(invocationCount.snapshot().count == 1)
+
+        switch secondResult {
+        case .success:
+            Issue.record("Expected concurrent captureOnce call to be throttled")
+        case .failure(let error):
+            #expect((error as? CaptureError) == .throttled)
+        }
     }
 
     @Test("CaptureEngine builds ScreenContextMessage with 0.65 JPEG encoding")
@@ -299,6 +475,41 @@ struct CaptureAndBridgeTests {
         #expect(SidecarWebSocketClient.reconnectDelay(attempt: 1, initialDelay: 0.5, maxDelay: 16.0) == 1.0)
         #expect(SidecarWebSocketClient.reconnectDelay(attempt: 2, initialDelay: 0.5, maxDelay: 16.0) == 2.0)
         #expect(SidecarWebSocketClient.reconnectDelay(attempt: 10, initialDelay: 0.5, maxDelay: 16.0) == 16.0)
+    }
+
+    @Test("SidecarWebSocketClient ignores stale URLSessionWebSocketTask open/close callbacks")
+    @MainActor
+    func webSocketClientIgnoresStaleTaskCallbacks() {
+        let client = SidecarWebSocketClient(url: URL(string: "ws://127.0.0.1:1")!)
+        defer { client.disconnect() }
+
+        let staleTask = client.makeDetachedTaskForTesting()
+        client.connect()
+        let activeTask = client.activeWebSocketTaskForTesting
+        #expect(activeTask != nil)
+        #expect(activeTask !== staleTask)
+        #expect(client.connectionState == .connecting)
+
+        // Stale task reporting open or close must not corrupt the active task or connectionState.
+        client.handleSocketOpened(for: staleTask)
+        #expect(client.connectionState == .connecting)
+        #expect(client.activeWebSocketTaskForTesting === activeTask)
+
+        client.handleSocketClosedOrFailed(for: staleTask, errorDescription: "stale socket error")
+        #expect(client.connectionState == .connecting)
+        #expect(client.lastErrorDescription == nil)
+        #expect(client.activeWebSocketTaskForTesting === activeTask)
+
+        // Active task open transitions to .connected, and stale close still cannot disrupt it.
+        if let activeTask {
+            client.handleSocketOpened(for: activeTask)
+            #expect(client.connectionState == .connected)
+
+            client.handleSocketClosedOrFailed(for: staleTask, errorDescription: "delayed stale close")
+            #expect(client.connectionState == .connected)
+            #expect(client.lastErrorDescription == nil)
+            #expect(client.activeWebSocketTaskForTesting === activeTask)
+        }
     }
 
     // MARK: - Image Helpers for Vision OCR Tests

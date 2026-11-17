@@ -73,7 +73,7 @@ public actor VisionRedactor {
     public init(
         customPatterns: [String] = [],
         recognitionLevel: VNRequestTextRecognitionLevel = .accurate,
-        preferCPUOnly: Bool = false,
+        preferCPUOnly: Bool = true,
         semanticClassifier: (any SemanticPIIClassifying)? = nil,
         semanticPrivacyEnabled: Bool = false
     ) {
@@ -138,12 +138,19 @@ public actor VisionRedactor {
         return await Task.detached(priority: .userInitiated) {
             let request = VNRecognizeTextRequest()
             request.recognitionLevel = level
+            request.automaticallyDetectsLanguage = false
+            request.recognitionLanguages = ["en-US"]
             if cpuOnly,
                let cpuDevice = MLComputeDevice.allComputeDevices.first(where: { device in
                    if case .cpu = device { return true }
                    return false
                }) {
                 request.setComputeDevice(cpuDevice, for: .main)
+                if let stages = try? request.supportedComputeStageDevices.keys {
+                    for stage in stages {
+                        request.setComputeDevice(cpuDevice, for: stage)
+                    }
+                }
             }
             // Disable language correction so API keys and tokens are not rewritten into words.
             request.usesLanguageCorrection = false

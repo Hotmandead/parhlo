@@ -36,6 +36,45 @@ struct AudioHotkeyAndCoordinatorTests {
         #expect(AudioEngineManager.computePCM16RMS(Data(count: 320)) == 0.0)
     }
 
+    @Test("AudioEngineManager converts discrete 3ch Float32 buffers to 16kHz Int16 PCM via channel 0 fallback")
+    func discreteMultiChannelUpstreamAudioConversion() throws {
+        let discrete3ChLayout = try #require(AVAudioChannelLayout(layoutTag: kAudioChannelLayoutTag_DiscreteInOrder | 3))
+        let multiChannelFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 48_000,
+            interleaved: false,
+            channelLayout: discrete3ChLayout
+        )
+        let targetFormat = try #require(AudioEngineManager.makePCMInt16Format(sampleRate: 16_000))
+        let fallbackMonoFormat = try #require(AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1))
+        let converter = try #require(
+            AVAudioConverter(from: multiChannelFormat, to: targetFormat)
+                ?? AVAudioConverter(from: fallbackMonoFormat, to: targetFormat)
+        )
+
+        let frameCount: AVAudioFrameCount = 4_800
+        let inputBuffer = try #require(AVAudioPCMBuffer(pcmFormat: multiChannelFormat, frameCapacity: frameCount))
+        inputBuffer.frameLength = frameCount
+        let channels = try #require(inputBuffer.floatChannelData)
+        for i in 0..<Int(frameCount) {
+            channels[0][i] = Float(sin(2.0 * .pi * 440.0 * Double(i) / 48_000.0) * 0.4)
+            channels[1][i] = 0
+            channels[2][i] = 0
+        }
+
+        let pcm16 = try #require(
+            AudioEngineManager.convertToPCMInt16Data(
+                buffer: inputBuffer,
+                converter: converter,
+                targetFormat: targetFormat
+            )
+        )
+
+        #expect(pcm16.count >= 2_400)
+        #expect(pcm16.count % MemoryLayout<Int16>.size == 0)
+        #expect(AudioEngineManager.computePCM16RMS(pcm16) > 0.1)
+    }
+
     @Test("AudioEngineManager converts 24kHz Int16 PCM to 48kHz Float32 playback buffer")
     func downstreamAudioConversion() throws {
         let sourceFormat = try #require(AudioEngineManager.makePCMInt16Format(sampleRate: 24_000))
@@ -86,6 +125,19 @@ struct AudioHotkeyAndCoordinatorTests {
         // Hold >= 0.35s starts on press and auto-stops on release.
         #expect(detector.process(flags: [.control, .option], now: t0.addingTimeInterval(1.0)) == true)
         #expect(detector.process(flags: [], now: t0.addingTimeInterval(1.5)) == false)
+        #expect(detector.isSessionActive == false)
+
+        // Releasing Command from Control+Option+Command must not trigger a spurious Control+Option chord.
+        #expect(detector.process(flags: [.control, .option, .command], now: t0.addingTimeInterval(2.0)) == nil)
+        #expect(detector.process(flags: [.control, .option], now: t0.addingTimeInterval(2.05)) == nil)
+        #expect(detector.process(flags: [], now: t0.addingTimeInterval(2.1)) == nil)
+        #expect(detector.isSessionActive == false)
+
+        // Escalating Control+Option into Control+Option+Command within 250ms rolls back accidental start.
+        #expect(detector.process(flags: [.control, .option], now: t0.addingTimeInterval(3.0)) == true)
+        #expect(detector.process(flags: [.control, .option, .command], now: t0.addingTimeInterval(3.04)) == false)
+        #expect(detector.process(flags: [.control, .option], now: t0.addingTimeInterval(3.08)) == nil)
+        #expect(detector.process(flags: [], now: t0.addingTimeInterval(3.12)) == nil)
         #expect(detector.isSessionActive == false)
     }
 
@@ -144,5 +196,70 @@ struct AudioHotkeyAndCoordinatorTests {
 
         coordinator.overlayStore.appendChatMessage(isUser: true, text: "Where is the filter bar?")
         #expect(coordinator.overlayStore.messages.last?.text == "Where is the filter bar?")
+    }
+
+    @Test("OfflineSpeechManager rapid utterance replacement keeps isSpeaking true for active utterance")
+    @MainActor
+    func offlineSpeechRapidUtteranceReplacement() async {
+        let speech = OfflineSpeechManager()
+        speech.speak("First offline response that should be replaced immediately.")
+        speech.speak("Second offline response.")
+        #expect(speech.isSpeaking == true)
+
+        try? await Task.sleep(for: .milliseconds(40))
+        #expect(speech.isSpeaking == true)
+
+        speech.stopImmediately()
+        #expect(speech.isSpeaking == false)
+    }
+
+    @Test("PlaybackTapGate blocks speaker feedback without AEC, requires sustained frames with AEC, and enforces tail holdoff")
+    func playbackTapGateAntiFeedbackBehavior() {
+        let gate = PlaybackTapGate()
+
+        // Without hardware AEC, loud speaker playback must NEVER unlock raw buffers or trigger barge-in.
+        gate.setVoiceProcessingActive(false)
+        gate.setPlaying(true)
+        for _ in 0..<5 {
+            let decision = gate.evaluate(rms: 0.15, vadEnabled: true, vadThreshold: 0.065, framesRequired: 3)
+            #expect(decision.forwardRawBuffer == false)
+            #expect(decision.triggeredBargeIn == false)
+        }
+
+        // With hardware AEC, single transient spikes must not unlock; 3 sustained frames trigger barge-in.
+        gate.setVoiceProcessingActive(true)
+        let spike1 = gate.evaluate(rms: 0.09, vadEnabled: true, vadThreshold: 0.065, framesRequired: 3)
+        let quiet = gate.evaluate(rms: 0.01, vadEnabled: true, vadThreshold: 0.065, framesRequired: 3)
+        #expect(spike1.forwardRawBuffer == false)
+        #expect(quiet.forwardRawBuffer == false)
+
+        let frame1 = gate.evaluate(rms: 0.09, vadEnabled: true, vadThreshold: 0.065, framesRequired: 3)
+        let frame2 = gate.evaluate(rms: 0.09, vadEnabled: true, vadThreshold: 0.065, framesRequired: 3)
+        let frame3 = gate.evaluate(rms: 0.09, vadEnabled: true, vadThreshold: 0.065, framesRequired: 3)
+        #expect(frame1 == PlaybackTapDecision(forwardRawBuffer: false, triggeredBargeIn: false))
+        #expect(frame2 == PlaybackTapDecision(forwardRawBuffer: false, triggeredBargeIn: false))
+        #expect(frame3 == PlaybackTapDecision(forwardRawBuffer: true, triggeredBargeIn: true))
+
+        // Post-playback holdoff blocks room/speaker tail immediately after playback ends, then opens after holdoff.
+        gate.setPlaying(true)
+        gate.setPlaying(false, holdoffSeconds: 0.35)
+        let tNow = DispatchTime.now().uptimeNanoseconds
+        let duringTail = gate.evaluate(
+            rms: 0.04,
+            vadEnabled: true,
+            vadThreshold: 0.065,
+            framesRequired: 3,
+            nowNanoseconds: tNow + 100_000_000
+        )
+        #expect(duringTail == PlaybackTapDecision(forwardRawBuffer: false, triggeredBargeIn: false))
+
+        let afterTail = gate.evaluate(
+            rms: 0.04,
+            vadEnabled: true,
+            vadThreshold: 0.065,
+            framesRequired: 3,
+            nowNanoseconds: tNow + 400_000_000
+        )
+        #expect(afterTail == PlaybackTapDecision(forwardRawBuffer: true, triggeredBargeIn: false))
     }
 }

@@ -26,15 +26,20 @@ public final class AudioEngineManager {
     public private(set) var inputRMSLevel: Float = 0.0
 
     @ObservationIgnored public var voiceProcessingEnabled: Bool = true
-    @ObservationIgnored public var localVADThreshold: Float = 0.025
+    @ObservationIgnored public var localVADThreshold: Float = 0.065
     @ObservationIgnored public var localVADEnabled: Bool = true
+    @ObservationIgnored public var consecutiveVADFramesRequired: Int = 3
+    @ObservationIgnored public var postPlaybackHoldoffSeconds: TimeInterval = 0.35
 
     @ObservationIgnored public var onAudioChunk: (@Sendable (Data) -> Void)?
     @ObservationIgnored public var onRawAudioBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
     @ObservationIgnored public var onLocalVoiceActivity: (@Sendable () -> Void)?
+    @ObservationIgnored public var onPlaybackStateChanged: (@MainActor (Bool) -> Void)?
+    @ObservationIgnored public var onSpeechEnergyDetected: (@MainActor (Float) -> Void)?
     @ObservationIgnored public var onError: (@Sendable (String) -> Void)?
 
     @ObservationIgnored private let worker = AudioGraphWorker()
+    @ObservationIgnored internal let playbackTapGate = PlaybackTapGate()
     @ObservationIgnored private var sessionGeneration: UInt64 = 0
     @ObservationIgnored private var playbackToken: UInt64 = 0
     @ObservationIgnored private var lastLocalVADTrigger: Date = .distantPast
@@ -58,12 +63,16 @@ public final class AudioEngineManager {
         let rawBufferCallback = onRawAudioBuffer
         let vadThreshold = localVADThreshold
         let vadEnabled = localVADEnabled
+        let framesRequired = max(1, consecutiveVADFramesRequired)
+        let rmsGate = RMSThrottleGate(minIntervalNanoseconds: 40_000_000)
 
         sessionGeneration &+= 1
         let gen = sessionGeneration
         isRunning = true
         isPlaybackRunning = true
         isVoiceProcessingActive = false
+        playbackTapGate.setVoiceProcessingActive(false)
+        playbackTapGate.resetHoldoff()
 
         worker.startCaptureAndPlayback(
             voiceProcessingEnabled: voiceProcessing,
@@ -71,16 +80,28 @@ public final class AudioEngineManager {
             upTargetFormat: upTargetFormat,
             chunkCallback: chunkCallback,
             rawBufferCallback: rawBufferCallback,
+            playbackTapGate: playbackTapGate,
+            vadEnabled: vadEnabled,
+            vadThreshold: vadThreshold,
+            framesRequired: framesRequired,
+            onBargeInTriggered: { [weak self] in
+                Task { @MainActor [weak self] in
+                    guard let self, self.sessionGeneration == gen else { return }
+                    guard vadEnabled && self.isVoiceProcessingActive && self.isPlayingAudio else { return }
+                    let now = Date()
+                    if now.timeIntervalSince(self.lastLocalVADTrigger) >= 0.4 {
+                        self.lastLocalVADTrigger = now
+                        self.onLocalVoiceActivity?()
+                    }
+                }
+            },
             onRMS: { [weak self] rms in
+                guard rms >= vadThreshold || rmsGate.shouldEmit() else { return }
                 Task { @MainActor [weak self] in
                     guard let self, self.sessionGeneration == gen else { return }
                     self.inputRMSLevel = rms
-                    if vadEnabled && self.isPlayingAudio && rms >= vadThreshold {
-                        let now = Date()
-                        if now.timeIntervalSince(self.lastLocalVADTrigger) >= 0.4 {
-                            self.lastLocalVADTrigger = now
-                            self.onLocalVoiceActivity?()
-                        }
+                    if rms >= vadThreshold && !self.isPlayingAudio {
+                        self.onSpeechEnergyDetected?(rms)
                     }
                 }
             },
@@ -90,12 +111,19 @@ public final class AudioEngineManager {
                     switch event {
                     case .started(let voiceProcessingActive):
                         self.isVoiceProcessingActive = voiceProcessingActive
+                        self.playbackTapGate.setVoiceProcessingActive(voiceProcessingActive)
                     case .fellBackToStandardCapture:
+                        self.playbackToken &+= 1
+                        self.setPlayingState(false, applyHoldoff: false)
                         self.isVoiceProcessingActive = false
+                        self.playbackTapGate.setVoiceProcessingActive(false)
                     case .failed(let message):
+                        self.playbackToken &+= 1
+                        self.setPlayingState(false, applyHoldoff: false)
                         self.isRunning = false
                         self.isPlaybackRunning = false
                         self.isVoiceProcessingActive = false
+                        self.playbackTapGate.setVoiceProcessingActive(false)
                         self.inputRMSLevel = 0
                         self.onError?(message)
                     }
@@ -104,35 +132,15 @@ public final class AudioEngineManager {
         )
     }
 
-    /// Starts playback-only `AVAudioEngine` output so typed prompts can speak responses without opening the mic.
-    public func startPlaybackOnlyIfNeeded() throws {
-        guard !isRunning && !isPlaybackRunning else { return }
-
-        guard let downSourceFormat = Self.makePCMInt16Format(sampleRate: Self.downstreamSampleRate) else {
-            throw AudioEngineError.unsupportedFormat
-        }
-
-        let gen = sessionGeneration
-        isPlaybackRunning = true
-
-        worker.startPlaybackOnlyIfNeeded(downSourceFormat: downSourceFormat) { [weak self] error in
-            guard let error else { return }
-            Task { @MainActor [weak self] in
-                guard let self, self.sessionGeneration == gen else { return }
-                self.isPlaybackRunning = false
-                self.onError?(error.localizedDescription)
-            }
-        }
-    }
-
     /// Stops audio capture and playback and tears down the `AVAudioEngine` graph.
     public func stop() {
         guard isRunning || isPlaybackRunning else { return }
 
         sessionGeneration &+= 1
         playbackToken &+= 1
-        isPlayingAudio = false
+        setPlayingState(false, applyHoldoff: false)
         isVoiceProcessingActive = false
+        playbackTapGate.setVoiceProcessingActive(false)
         inputRMSLevel = 0
         isRunning = false
         isPlaybackRunning = false
@@ -160,29 +168,33 @@ public final class AudioEngineManager {
         }
 
         let gen = sessionGeneration
+        playbackToken &+= 1
         let token = playbackToken
-        isPlayingAudio = true
+        setPlayingState(true, applyHoldoff: false)
 
         worker.enqueuePlayback(
             pcm24kData: pcm24kData,
+            token: token,
             downSourceFormat: downSourceFormat,
-            onPlaybackStateChanged: { [weak self] isPlaying in
+            onPlaybackStateChanged: { [weak self] isPlaying, completedToken in
                 Task { @MainActor [weak self] in
                     guard let self,
                           self.sessionGeneration == gen,
-                          self.playbackToken == token else {
+                          self.playbackToken == completedToken else {
                         return
                     }
-                    self.isPlayingAudio = isPlaying
+                    self.setPlayingState(isPlaying, applyHoldoff: !isPlaying)
                 }
             },
-            onPlaybackStartFailed: { [weak self] errorMessage in
+            onPlaybackStartFailed: { [weak self] errorMessage, failedToken in
                 Task { @MainActor [weak self] in
                     guard let self, self.sessionGeneration == gen else { return }
                     if !self.isRunning {
                         self.isPlaybackRunning = false
                     }
-                    self.isPlayingAudio = false
+                    if self.playbackToken == failedToken {
+                        self.setPlayingState(false, applyHoldoff: false)
+                    }
                     self.onError?(errorMessage)
                 }
             }
@@ -192,8 +204,17 @@ public final class AudioEngineManager {
     /// Immediately flushes queued playback buffers on VAD or manual barge-in.
     public func stopPlaybackImmediately() {
         playbackToken &+= 1
-        isPlayingAudio = false
+        setPlayingState(false, applyHoldoff: false)
         worker.stopPlaybackImmediately()
+    }
+
+    private func setPlayingState(_ playing: Bool, applyHoldoff: Bool) {
+        let changed = isPlayingAudio != playing
+        isPlayingAudio = playing
+        playbackTapGate.setPlaying(playing, holdoffSeconds: applyHoldoff ? postPlaybackHoldoffSeconds : 0)
+        if changed {
+            onPlaybackStateChanged?(playing)
+        }
     }
 
     // MARK: - Nonisolated Audio Thread Bridges
@@ -206,22 +227,39 @@ public final class AudioEngineManager {
         upTargetFormat: AVAudioFormat,
         chunkCallback: (@Sendable (Data) -> Void)?,
         rawBufferCallback: (@Sendable (AVAudioPCMBuffer) -> Void)?,
+        playbackTapGate: PlaybackTapGate,
+        vadEnabled: Bool,
+        vadThreshold: Float,
+        framesRequired: Int,
+        onBargeInTriggered: @escaping @Sendable () -> Void,
         onBufferDelivered: @escaping @Sendable () -> Void,
         onRMS: @escaping @Sendable (Float) -> Void
     ) {
+        let monoConverterCache = MonoConverterCache()
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
-            onBufferDelivered()
-            rawBufferCallback?(buffer)
-
             guard let pcmData = convertToPCMInt16Data(
                 buffer: buffer,
                 converter: upConverter,
-                targetFormat: upTargetFormat
-            ) else {
+                targetFormat: upTargetFormat,
+                monoConverterCache: monoConverterCache
+            ), !pcmData.isEmpty else {
                 return
             }
 
+            onBufferDelivered()
             let rms = computePCM16RMS(pcmData)
+            let decision = playbackTapGate.evaluate(
+                rms: rms,
+                vadEnabled: vadEnabled,
+                vadThreshold: vadThreshold,
+                framesRequired: framesRequired
+            )
+            if decision.triggeredBargeIn {
+                onBargeInTriggered()
+            }
+            if decision.forwardRawBuffer {
+                rawBufferCallback?(buffer)
+            }
             chunkCallback?(pcmData)
             onRMS(rms)
         }
@@ -253,8 +291,125 @@ public final class AudioEngineManager {
         converter: AVAudioConverter,
         targetFormat: AVAudioFormat
     ) -> Data? {
+        convertToPCMInt16Data(
+            buffer: buffer,
+            converter: converter,
+            targetFormat: targetFormat,
+            monoConverterCache: nil
+        )
+    }
+
+    nonisolated fileprivate static func convertToPCMInt16Data(
+        buffer: AVAudioPCMBuffer,
+        converter: AVAudioConverter,
+        targetFormat: AVAudioFormat,
+        monoConverterCache: MonoConverterCache?
+    ) -> Data? {
         guard buffer.frameLength > 0 else { return nil }
 
+        let inputFormat = buffer.format
+        let prefersChannel0Extraction = inputFormat.channelCount > 2 || isDiscreteOrUnspecifiedLayout(inputFormat)
+
+        if !prefersChannel0Extraction,
+           let direct = convertSingleBufferToPCMInt16Data(
+               buffer: buffer,
+               converter: converter,
+               targetFormat: targetFormat
+           ) {
+            return direct
+        }
+
+        // Extract channel 0 directly for discrete / multi-channel hardware & VoiceProcessingIO
+        // layouts (e.g. 3ch VPAUAggregateAudioDevice) where AVAudioConverter either has no downmix
+        // matrix or silently zeroes unmapped discrete channels.
+        if let monoConverted = convertChannel0Float32ToPCMInt16Data(
+            buffer: buffer,
+            targetFormat: targetFormat,
+            monoConverterCache: monoConverterCache
+        ) {
+            return monoConverted
+        }
+
+        guard prefersChannel0Extraction else {
+            return nil
+        }
+
+        return convertSingleBufferToPCMInt16Data(
+            buffer: buffer,
+            converter: converter,
+            targetFormat: targetFormat
+        )
+    }
+
+    nonisolated private static func isDiscreteOrUnspecifiedLayout(_ format: AVAudioFormat) -> Bool {
+        guard format.channelCount > 1 else { return false }
+        guard let tag = format.channelLayout?.layoutTag else {
+            return true
+        }
+        if tag == kAudioChannelLayoutTag_UseChannelDescriptions || tag == kAudioChannelLayoutTag_UseChannelBitmap {
+            return true
+        }
+        return (tag & 0xFFFF_0000) == kAudioChannelLayoutTag_DiscreteInOrder
+    }
+
+    nonisolated private static func convertChannel0Float32ToPCMInt16Data(
+        buffer: AVAudioPCMBuffer,
+        targetFormat: AVAudioFormat,
+        monoConverterCache: MonoConverterCache?
+    ) -> Data? {
+        let inputFormat = buffer.format
+        guard inputFormat.channelCount > 1,
+              inputFormat.commonFormat == .pcmFormatFloat32,
+              !inputFormat.isInterleaved,
+              let srcChannels = buffer.floatChannelData,
+              let monoFloatFormat = AVAudioFormat(
+                  commonFormat: .pcmFormatFloat32,
+                  sampleRate: max(1.0, inputFormat.sampleRate),
+                  channels: 1,
+                  interleaved: false
+              ),
+              let monoBuffer = AVAudioPCMBuffer(pcmFormat: monoFloatFormat, frameCapacity: buffer.frameLength),
+              let dstChannels = monoBuffer.floatChannelData else {
+            return nil
+        }
+
+        let frameCount = Int(buffer.frameLength)
+        memcpy(dstChannels[0], srcChannels[0], frameCount * MemoryLayout<Float>.size)
+        monoBuffer.frameLength = buffer.frameLength
+
+        return monoConverterCache?.convert(monoBuffer: monoBuffer, sourceFormat: monoFloatFormat, targetFormat: targetFormat)
+            ?? AVAudioConverter(from: monoFloatFormat, to: targetFormat).flatMap {
+                convertSingleBufferToPCMInt16Data(
+                    buffer: monoBuffer,
+                    converter: $0,
+                    targetFormat: targetFormat
+                )
+            }
+    }
+
+    nonisolated fileprivate static func makeMonoFallbackConverter(
+        from inputFormat: AVAudioFormat,
+        to targetFormat: AVAudioFormat
+    ) -> AVAudioConverter? {
+        guard inputFormat.channelCount > 1,
+              inputFormat.commonFormat == .pcmFormatFloat32,
+              !inputFormat.isInterleaved,
+              let monoFloatFormat = AVAudioFormat(
+                  commonFormat: .pcmFormatFloat32,
+                  sampleRate: max(1.0, inputFormat.sampleRate),
+                  channels: 1,
+                  interleaved: false
+              ) else {
+            return nil
+        }
+        return AVAudioConverter(from: monoFloatFormat, to: targetFormat)
+    }
+
+    nonisolated fileprivate static func convertSingleBufferToPCMInt16Data(
+        buffer: AVAudioPCMBuffer,
+        converter: AVAudioConverter,
+        targetFormat: AVAudioFormat
+    ) -> Data? {
         let ratio = targetFormat.sampleRate / max(1.0, buffer.format.sampleRate)
         let estimatedFrames = max(1, AVAudioFrameCount(ceil(Double(buffer.frameLength) * ratio)) + 16)
         guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: estimatedFrames) else {
@@ -370,6 +525,145 @@ private final class TapDeliveryFlag: @unchecked Sendable {
     }
 }
 
+private final class MonoConverterCache: @unchecked Sendable {
+    private struct State {
+        var sourceFormat: AVAudioFormat?
+        var targetFormat: AVAudioFormat?
+        var converter: AVAudioConverter?
+    }
+
+    private let lock = OSAllocatedUnfairLock<State>(initialState: State())
+
+    func convert(
+        monoBuffer: AVAudioPCMBuffer,
+        sourceFormat: AVAudioFormat,
+        targetFormat: AVAudioFormat
+    ) -> Data? {
+        lock.withLock { state in
+            let activeConverter: AVAudioConverter?
+            if let existing = state.converter,
+               state.sourceFormat == sourceFormat,
+               state.targetFormat == targetFormat {
+                activeConverter = existing
+            } else {
+                let created = AVAudioConverter(from: sourceFormat, to: targetFormat)
+                state.sourceFormat = sourceFormat
+                state.targetFormat = targetFormat
+                state.converter = created
+                activeConverter = created
+            }
+
+            guard let activeConverter else { return nil }
+            return AudioEngineManager.convertSingleBufferToPCMInt16Data(
+                buffer: monoBuffer,
+                converter: activeConverter,
+                targetFormat: targetFormat
+            )
+        }
+    }
+}
+
+internal struct PlaybackTapDecision: Sendable, Equatable {
+    let forwardRawBuffer: Bool
+    let triggeredBargeIn: Bool
+}
+
+internal final class PlaybackTapGate: @unchecked Sendable {
+    private struct State {
+        var isPlaying: Bool = false
+        var voiceProcessingActive: Bool = false
+        var holdoffUntilNanoseconds: UInt64 = 0
+        var consecutiveVADFrames: Int = 0
+    }
+
+    private let lock = OSAllocatedUnfairLock<State>(initialState: State())
+
+    func setVoiceProcessingActive(_ active: Bool) {
+        lock.withLock { state in
+            state.voiceProcessingActive = active
+            if !active {
+                state.consecutiveVADFrames = 0
+            }
+        }
+    }
+
+    func resetHoldoff() {
+        lock.withLock { state in
+            state.holdoffUntilNanoseconds = 0
+            state.consecutiveVADFrames = 0
+        }
+    }
+
+    func setPlaying(_ playing: Bool, holdoffSeconds: TimeInterval = 0) {
+        let now = DispatchTime.now().uptimeNanoseconds
+        let holdoffNs = holdoffSeconds > 0 ? UInt64(holdoffSeconds * 1_000_000_000) : 0
+        lock.withLock { state in
+            state.isPlaying = playing
+            state.consecutiveVADFrames = 0
+            if playing {
+                state.holdoffUntilNanoseconds = 0
+            } else if holdoffNs > 0 {
+                state.holdoffUntilNanoseconds = now &+ holdoffNs
+            }
+        }
+    }
+
+    func evaluate(
+        rms: Float,
+        vadEnabled: Bool,
+        vadThreshold: Float,
+        framesRequired: Int,
+        nowNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
+    ) -> PlaybackTapDecision {
+        lock.withLock { state in
+            if state.isPlaying {
+                guard vadEnabled, state.voiceProcessingActive else {
+                    state.consecutiveVADFrames = 0
+                    return PlaybackTapDecision(forwardRawBuffer: false, triggeredBargeIn: false)
+                }
+                if rms >= vadThreshold {
+                    state.consecutiveVADFrames += 1
+                    if state.consecutiveVADFrames >= max(1, framesRequired) {
+                        state.isPlaying = false
+                        state.holdoffUntilNanoseconds = 0
+                        state.consecutiveVADFrames = 0
+                        return PlaybackTapDecision(forwardRawBuffer: true, triggeredBargeIn: true)
+                    }
+                } else {
+                    state.consecutiveVADFrames = 0
+                }
+                return PlaybackTapDecision(forwardRawBuffer: false, triggeredBargeIn: false)
+            }
+
+            if state.holdoffUntilNanoseconds > 0 && nowNanoseconds < state.holdoffUntilNanoseconds {
+                return PlaybackTapDecision(forwardRawBuffer: false, triggeredBargeIn: false)
+            }
+            state.holdoffUntilNanoseconds = 0
+            return PlaybackTapDecision(forwardRawBuffer: true, triggeredBargeIn: false)
+        }
+    }
+}
+
+private final class RMSThrottleGate: @unchecked Sendable {
+    private let minIntervalNanoseconds: UInt64
+    private let lock = OSAllocatedUnfairLock<UInt64>(initialState: 0)
+
+    init(minIntervalNanoseconds: UInt64) {
+        self.minIntervalNanoseconds = minIntervalNanoseconds
+    }
+
+    func shouldEmit() -> Bool {
+        let now = DispatchTime.now().uptimeNanoseconds
+        return lock.withLock { last in
+            if last == 0 || now &- last >= minIntervalNanoseconds {
+                last = now
+                return true
+            }
+            return false
+        }
+    }
+}
+
 /// Owns `AVAudioEngine` lifecycle and audio graph operations on a dedicated Default-QoS serial queue
 /// so `@MainActor` (`User-interactive`) never blocks on CoreAudio's `Default`-QoS internal threads.
 private final class AudioGraphWorker: @unchecked Sendable {
@@ -384,6 +678,7 @@ private final class AudioGraphWorker: @unchecked Sendable {
     private var isPlaybackActive: Bool = false
     private var activeScheduledBuffers: Int = 0
     private var playbackGeneration: UInt64 = 0
+    private var latestPlaybackToken: UInt64 = 0
     private var captureGeneration: UInt64 = 0
 
     deinit {
@@ -397,6 +692,7 @@ private final class AudioGraphWorker: @unchecked Sendable {
                 }
                 playerNode?.stop()
                 engine?.stop()
+                engine?.reset()
             }
         }
     }
@@ -407,6 +703,11 @@ private final class AudioGraphWorker: @unchecked Sendable {
         upTargetFormat: AVAudioFormat,
         chunkCallback: (@Sendable (Data) -> Void)?,
         rawBufferCallback: (@Sendable (AVAudioPCMBuffer) -> Void)?,
+        playbackTapGate: PlaybackTapGate,
+        vadEnabled: Bool,
+        vadThreshold: Float,
+        framesRequired: Int,
+        onBargeInTriggered: @escaping @Sendable () -> Void,
         onRMS: @escaping @Sendable (Float) -> Void,
         onEvent: @escaping @Sendable (CaptureGraphEvent) -> Void
     ) {
@@ -422,6 +723,11 @@ private final class AudioGraphWorker: @unchecked Sendable {
                     upTargetFormat: upTargetFormat,
                     chunkCallback: chunkCallback,
                     rawBufferCallback: rawBufferCallback,
+                    playbackTapGate: playbackTapGate,
+                    vadEnabled: vadEnabled,
+                    vadThreshold: vadThreshold,
+                    framesRequired: framesRequired,
+                    onBargeInTriggered: onBargeInTriggered,
                     onRMS: onRMS,
                     onEvent: onEvent
                 )
@@ -438,151 +744,170 @@ private final class AudioGraphWorker: @unchecked Sendable {
         upTargetFormat: AVAudioFormat,
         chunkCallback: (@Sendable (Data) -> Void)?,
         rawBufferCallback: (@Sendable (AVAudioPCMBuffer) -> Void)?,
+        playbackTapGate: PlaybackTapGate,
+        vadEnabled: Bool,
+        vadThreshold: Float,
+        framesRequired: Int,
+        onBargeInTriggered: @escaping @Sendable () -> Void,
         onRMS: @escaping @Sendable (Float) -> Void,
         onEvent: @escaping @Sendable (CaptureGraphEvent) -> Void
     ) throws -> Bool {
-        var audioEngine = AVAudioEngine()
-        var player = AVAudioPlayerNode()
-        audioEngine.attach(player)
-
-        // Ensure the output graph nodes exist before toggling voice processing on macOS CoreAudio.
-        _ = audioEngine.mainMixerNode
-        _ = audioEngine.outputNode
-
-        let voiceProcessingActive: Bool
-        if voiceProcessingEnabled {
-            do {
-                try audioEngine.inputNode.setVoiceProcessingEnabled(true)
-                voiceProcessingActive = true
-            } catch {
-                // Rebuild a fresh graph without AUVoiceProcessor if the aggregate device fails synchronously.
-                audioEngine = AVAudioEngine()
-                player = AVAudioPlayerNode()
-                audioEngine.attach(player)
-                _ = audioEngine.mainMixerNode
-                _ = audioEngine.outputNode
-                voiceProcessingActive = false
-            }
-        } else {
-            voiceProcessingActive = false
-        }
-
-        let inputNode = audioEngine.inputNode
-        let mainMixer = audioEngine.mainMixerNode
-        let mixerFormat = mainMixer.outputFormat(forBus: 0)
-        audioEngine.connect(player, to: mainMixer, format: mixerFormat)
-
-        guard let downConverter = AVAudioConverter(from: downSourceFormat, to: mixerFormat) else {
-            throw AudioEngineError.converterInitializationFailed
-        }
-
-        let hardwareInputFormat = inputNode.outputFormat(forBus: 0)
-        guard hardwareInputFormat.sampleRate > 0, hardwareInputFormat.channelCount > 0 else {
-            throw AudioEngineError.unsupportedFormat
-        }
-        guard let upConverter = AVAudioConverter(from: hardwareInputFormat, to: upTargetFormat) else {
-            throw AudioEngineError.converterInitializationFailed
-        }
-
-        let tapFlag = TapDeliveryFlag()
-        inputNode.removeTap(onBus: 0)
-        AudioEngineManager.installInputTap(
-            on: inputNode,
-            format: hardwareInputFormat,
-            upConverter: upConverter,
-            upTargetFormat: upTargetFormat,
-            chunkCallback: chunkCallback,
-            rawBufferCallback: rawBufferCallback,
-            onBufferDelivered: {
-                tapFlag.markDelivered()
-            },
-            onRMS: onRMS
-        )
+        let audioEngine = AVAudioEngine()
+        let player = AVAudioPlayerNode()
+        var didInstallTap = false
 
         do {
+            // Configure voice processing on inputNode before touching mainMixerNode/outputNode
+            // so CoreAudio builds its aggregate device cleanly without -10877 / 2003332927.
+            let voiceProcessingActive: Bool
+            if voiceProcessingEnabled {
+                try audioEngine.inputNode.setVoiceProcessingEnabled(true)
+                audioEngine.inputNode.isVoiceProcessingBypassed = false
+                audioEngine.inputNode.isVoiceProcessingAGCEnabled = true
+                voiceProcessingActive = true
+            } else {
+                voiceProcessingActive = false
+            }
+
+            audioEngine.attach(player)
+            let mainMixer = audioEngine.mainMixerNode
+            let mixerFormat = mainMixer.outputFormat(forBus: 0)
+            audioEngine.connect(player, to: mainMixer, format: mixerFormat)
+
+            guard let downConverter = AVAudioConverter(from: downSourceFormat, to: mixerFormat) else {
+                throw AudioEngineError.converterInitializationFailed
+            }
+
+            let inputNode = audioEngine.inputNode
+            let hardwareInputFormat = inputNode.outputFormat(forBus: 0)
+            guard hardwareInputFormat.sampleRate > 0, hardwareInputFormat.channelCount > 0 else {
+                throw AudioEngineError.unsupportedFormat
+            }
+            guard let upConverter = AVAudioConverter(from: hardwareInputFormat, to: upTargetFormat)
+                ?? AudioEngineManager.makeMonoFallbackConverter(from: hardwareInputFormat, to: upTargetFormat) else {
+                throw AudioEngineError.converterInitializationFailed
+            }
+
+            let tapFlag = TapDeliveryFlag()
+            inputNode.removeTap(onBus: 0)
+            AudioEngineManager.installInputTap(
+                on: inputNode,
+                format: hardwareInputFormat,
+                upConverter: upConverter,
+                upTargetFormat: upTargetFormat,
+                chunkCallback: chunkCallback,
+                rawBufferCallback: rawBufferCallback,
+                playbackTapGate: playbackTapGate,
+                vadEnabled: vadEnabled,
+                vadThreshold: vadThreshold,
+                framesRequired: framesRequired,
+                onBargeInTriggered: onBargeInTriggered,
+                onBufferDelivered: {
+                    tapFlag.markDelivered()
+                },
+                onRMS: onRMS
+            )
+            didInstallTap = true
+
             audioEngine.prepare()
             try audioEngine.start()
             player.play()
-        } catch {
-            inputNode.removeTap(onBus: 0)
-            throw AudioEngineError.engineStartFailed(error.localizedDescription)
-        }
 
-        captureGeneration &+= 1
-        let activeCaptureGen = captureGeneration
-        self.engine = audioEngine
-        self.playerNode = player
-        self.playbackConverter = downConverter
-        self.playbackSourceFormat = downSourceFormat
-        self.playbackTargetFormat = mixerFormat
-        self.activeScheduledBuffers = 0
-        self.isCapturing = true
-        self.isPlaybackActive = true
+            captureGeneration &+= 1
+            let activeCaptureGen = captureGeneration
+            self.engine = audioEngine
+            self.playerNode = player
+            self.playbackConverter = downConverter
+            self.playbackSourceFormat = downSourceFormat
+            self.playbackTargetFormat = mixerFormat
+            self.activeScheduledBuffers = 0
+            self.isCapturing = true
+            self.isPlaybackActive = true
 
-        // Watchdog: AUVoiceProcessor on macOS can return from start() without throwing while HAL StartIO
-        // fails with error 35 / -10877 and delivers zero tap buffers. Fall back to non-VP capture automatically.
-        let watchdogDelay: DispatchTimeInterval = voiceProcessingActive ? .milliseconds(900) : .milliseconds(1500)
-        queue.asyncAfter(deadline: .now() + watchdogDelay) { [weak self] in
-            guard let self,
-                  self.isCapturing,
-                  self.captureGeneration == activeCaptureGen,
-                  !tapFlag.hasDelivered else {
-                return
-            }
-
-            if voiceProcessingActive {
-                self.teardownOnQueue()
-                do {
-                    _ = try self.startCaptureAndPlaybackOnQueue(
-                        voiceProcessingEnabled: false,
-                        downSourceFormat: downSourceFormat,
-                        upTargetFormat: upTargetFormat,
-                        chunkCallback: chunkCallback,
-                        rawBufferCallback: rawBufferCallback,
-                        onRMS: onRMS,
-                        onEvent: onEvent
-                    )
-                    onEvent(.fellBackToStandardCapture)
-                } catch {
-                    onEvent(.failed(error.localizedDescription))
+            // Watchdog: AUVoiceProcessor on macOS can return from start() without throwing while HAL StartIO
+            // fails with error 35 / -10877 and delivers zero tap buffers. Fall back to non-VP capture automatically.
+            let watchdogDelay: DispatchTimeInterval = voiceProcessingActive ? .milliseconds(1400) : .milliseconds(1500)
+            queue.asyncAfter(deadline: .now() + watchdogDelay) { [weak self] in
+                guard let self,
+                      self.isCapturing,
+                      self.captureGeneration == activeCaptureGen,
+                      !tapFlag.hasDelivered else {
+                    return
                 }
-            } else {
-                self.teardownOnQueue()
-                onEvent(.failed("Microphone audio input did not start (no audio buffers received from hardware)."))
-            }
-        }
 
-        return voiceProcessingActive
-    }
-
-    func startPlaybackOnlyIfNeeded(
-        downSourceFormat: AVAudioFormat,
-        onFinished: @escaping @Sendable ((any Error)?) -> Void
-    ) {
-        queue.async { [weak self] in
-            guard let self else { return }
-            do {
-                try self.startPlaybackOnlyOnQueueIfNeeded(downSourceFormat: downSourceFormat)
-                onFinished(nil)
-            } catch {
-                onFinished(error)
+                if voiceProcessingActive {
+                    self.teardownOnQueue()
+                    do {
+                        _ = try self.startCaptureAndPlaybackOnQueue(
+                            voiceProcessingEnabled: false,
+                            downSourceFormat: downSourceFormat,
+                            upTargetFormat: upTargetFormat,
+                            chunkCallback: chunkCallback,
+                            rawBufferCallback: rawBufferCallback,
+                            playbackTapGate: playbackTapGate,
+                            vadEnabled: vadEnabled,
+                            vadThreshold: vadThreshold,
+                            framesRequired: framesRequired,
+                            onBargeInTriggered: onBargeInTriggered,
+                            onRMS: onRMS,
+                            onEvent: onEvent
+                        )
+                        onEvent(.fellBackToStandardCapture)
+                    } catch {
+                        onEvent(.failed(error.localizedDescription))
+                    }
+                } else {
+                    self.teardownOnQueue()
+                    onEvent(.failed("Microphone audio input did not start (no audio buffers received from hardware)."))
+                }
             }
+
+            return voiceProcessingActive
+        } catch {
+            if didInstallTap {
+                audioEngine.inputNode.removeTap(onBus: 0)
+            }
+            player.stop()
+            audioEngine.stop()
+            audioEngine.reset()
+
+            if voiceProcessingEnabled {
+                return try startCaptureAndPlaybackOnQueue(
+                    voiceProcessingEnabled: false,
+                    downSourceFormat: downSourceFormat,
+                    upTargetFormat: upTargetFormat,
+                    chunkCallback: chunkCallback,
+                    rawBufferCallback: rawBufferCallback,
+                    playbackTapGate: playbackTapGate,
+                    vadEnabled: vadEnabled,
+                    vadThreshold: vadThreshold,
+                    framesRequired: framesRequired,
+                    onBargeInTriggered: onBargeInTriggered,
+                    onRMS: onRMS,
+                    onEvent: onEvent
+                )
+            }
+
+            throw error
         }
     }
 
     func enqueuePlayback(
         pcm24kData: Data,
+        token: UInt64,
         downSourceFormat: AVAudioFormat,
-        onPlaybackStateChanged: @escaping @Sendable (Bool) -> Void,
-        onPlaybackStartFailed: @escaping @Sendable (String) -> Void
+        onPlaybackStateChanged: @escaping @Sendable (Bool, UInt64) -> Void,
+        onPlaybackStartFailed: @escaping @Sendable (String, UInt64) -> Void
     ) {
         queue.async { [weak self] in
             guard let self else { return }
+            self.latestPlaybackToken = token
+
             if !self.isCapturing && !self.isPlaybackActive {
                 do {
                     try self.startPlaybackOnlyOnQueueIfNeeded(downSourceFormat: downSourceFormat)
                 } catch {
-                    onPlaybackStartFailed(error.localizedDescription)
+                    onPlaybackStartFailed(error.localizedDescription, token)
                     return
                 }
             }
@@ -593,7 +918,7 @@ private final class AudioGraphWorker: @unchecked Sendable {
                   let playbackSourceFormat = self.playbackSourceFormat,
                   let playbackTargetFormat = self.playbackTargetFormat else {
                 if self.activeScheduledBuffers == 0 {
-                    onPlaybackStateChanged(false)
+                    onPlaybackStateChanged(false, self.latestPlaybackToken)
                 }
                 return
             }
@@ -605,7 +930,7 @@ private final class AudioGraphWorker: @unchecked Sendable {
                 targetFormat: playbackTargetFormat
             ) else {
                 if self.activeScheduledBuffers == 0 {
-                    onPlaybackStateChanged(false)
+                    onPlaybackStateChanged(false, self.latestPlaybackToken)
                 }
                 return
             }
@@ -678,13 +1003,13 @@ private final class AudioGraphWorker: @unchecked Sendable {
 
     private func handleScheduledBufferCompletion(
         generation: UInt64,
-        onPlaybackStateChanged: @escaping @Sendable (Bool) -> Void
+        onPlaybackStateChanged: @escaping @Sendable (Bool, UInt64) -> Void
     ) {
         queue.async { [weak self] in
             guard let self, self.playbackGeneration == generation else { return }
             self.activeScheduledBuffers = max(0, self.activeScheduledBuffers - 1)
             if self.activeScheduledBuffers == 0 {
-                onPlaybackStateChanged(false)
+                onPlaybackStateChanged(false, self.latestPlaybackToken)
             }
         }
     }
@@ -698,6 +1023,7 @@ private final class AudioGraphWorker: @unchecked Sendable {
             }
             playerNode?.stop()
             engine.stop()
+            engine.reset()
         }
 
         engine = nil

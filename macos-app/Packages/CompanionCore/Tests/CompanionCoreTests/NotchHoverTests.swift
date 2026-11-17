@@ -63,5 +63,63 @@ struct NotchHoverTests {
         notch.setExpanded(false, activateApp: false)
         #expect(notch.isExpanded == false)
         #expect(notch.panel.canBecomeKey == false)
+        #expect(notch.panel.isKeyWindow == false)
+    }
+
+    @Test("matchingTriggerScreenFrame locates top-center trigger across multiple displays")
+    func multiDisplayTriggerScreenMatching() {
+        let primary = NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let secondary = NSRect(x: 1440, y: 0, width: 1728, height: 1117)
+        let screens = [primary, secondary]
+
+        // Top-center of secondary display (midX = 2304, maxY = 1117)
+        let matchedSecondary = NotchPanelWindowController.matchingTriggerScreenFrame(
+            for: NSPoint(x: 2304, y: 1105),
+            in: screens
+        )
+        #expect(matchedSecondary == secondary)
+
+        // Top-center of primary display
+        let matchedPrimary = NotchPanelWindowController.matchingTriggerScreenFrame(
+            for: NSPoint(x: 720, y: 890),
+            in: screens
+        )
+        #expect(matchedPrimary == primary)
+
+        // Outside both trigger strips
+        let noneMatched = NotchPanelWindowController.matchingTriggerScreenFrame(
+            for: NSPoint(x: 2304, y: 500),
+            in: screens
+        )
+        #expect(noneMatched == nil)
+    }
+
+    @Test("NotchAssistantView.normalizedMicLevel maps silence, speech, and peak RMS cleanly")
+    func normalizedMicLevelMapping() {
+        #expect(NotchAssistantView.normalizedMicLevel(rms: 0.0) == 0.0)
+        #expect(NotchAssistantView.normalizedMicLevel(rms: -0.1) == 0.0)
+        let speechLevel = NotchAssistantView.normalizedMicLevel(rms: 0.035)
+        #expect(speechLevel > 0.45 && speechLevel < 0.55)
+        #expect(NotchAssistantView.normalizedMicLevel(rms: 0.5) == 1.0)
+    }
+
+    @Test("Opening Settings from expanded drawer minimizes back to collapsed pill")
+    @MainActor
+    func openSettingsMinimizesExpandedDrawer() {
+        let coordinator = AppCoordinator()
+        var settingsOpened = false
+        let notch = NotchPanelWindowController(coordinator: coordinator) {
+            settingsOpened = true
+        }
+        defer { notch.stopHoverMonitoring() }
+
+        notch.setExpanded(true, activateApp: false)
+        #expect(notch.isExpanded == true)
+        #expect(notch.panel.canBecomeKey == true)
+
+        notch.handleOpenSettingsFromDrawer()
+        #expect(settingsOpened == true)
+        #expect(notch.isExpanded == false)
+        #expect(notch.panel.canBecomeKey == false)
     }
 }

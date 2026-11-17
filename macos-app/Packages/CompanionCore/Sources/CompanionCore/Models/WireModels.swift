@@ -357,12 +357,39 @@ public struct BargeInMessage: Codable, Sendable, Equatable {
     }
 }
 
+/// Downstream live user speech transcription matching `schemas.InputTranscriptMessage`.
+public struct InputTranscriptMessage: Codable, Sendable, Equatable {
+    public let type: String
+    public let text: String
+    public let isFinal: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case text
+        case isFinal = "is_final"
+    }
+
+    public init(type: String = "input_transcript", text: String, isFinal: Bool = false) {
+        self.type = type
+        self.text = text
+        self.isFinal = isFinal
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.type = try container.decodeIfPresent(String.self, forKey: .type) ?? "input_transcript"
+        self.text = try container.decode(String.self, forKey: .text)
+        self.isFinal = try container.decodeIfPresent(Bool.self, forKey: .isFinal) ?? false
+    }
+}
+
 /// Discriminated union of all downstream messages sent from `agent-sidecar` to `macos-app`.
 public enum DownstreamEvent: Codable, Sendable, Equatable {
     case drawCommand(DrawCommandMessage)
     case audioDown(AudioDownMessage)
     case bargeIn(BargeInMessage)
     case hudState(HudStateMessage)
+    case inputTranscript(InputTranscriptMessage)
 
     private enum CodingKeys: String, CodingKey {
         case type
@@ -380,6 +407,8 @@ public enum DownstreamEvent: Codable, Sendable, Equatable {
             self = .bargeIn(try BargeInMessage(from: decoder))
         case "hud_state":
             self = .hudState(try HudStateMessage(from: decoder))
+        case "input_transcript":
+            self = .inputTranscript(try InputTranscriptMessage(from: decoder))
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .type,
@@ -398,6 +427,8 @@ public enum DownstreamEvent: Codable, Sendable, Equatable {
         case .bargeIn(let message):
             try message.encode(to: encoder)
         case .hudState(let message):
+            try message.encode(to: encoder)
+        case .inputTranscript(let message):
             try message.encode(to: encoder)
         }
     }

@@ -7,7 +7,7 @@ public actor AXInspector {
     public let maxDepth: Int
     public let maxElements: Int
     public let maxTextLength: Int
-    private let redactor: VisionRedactor
+    nonisolated internal let redactor: VisionRedactor
 
     public init(
         maxDepth: Int = 6,
@@ -104,6 +104,34 @@ public actor AXInspector {
         return true
     }
 
+    /// Checks visibility against `screenBounds` and converts `rect.origin` into display-local top-left coordinates
+    /// when `screenBounds` is non-nil (matching `0..W, 0..H`), preserving original coordinates when `nil`.
+    nonisolated public static func displayLocalRect(
+        _ rect: CGRect,
+        within screenBounds: CGRect?
+    ) -> (x: Int, y: Int, width: Int, height: Int)? {
+        guard isVisibleFrame(rect, within: screenBounds) else {
+            return nil
+        }
+
+        let localX: CGFloat
+        let localY: CGFloat
+        if let screenBounds {
+            localX = rect.origin.x - screenBounds.origin.x
+            localY = rect.origin.y - screenBounds.origin.y
+        } else {
+            localX = rect.origin.x
+            localY = rect.origin.y
+        }
+
+        return (
+            x: Int(localX.rounded()),
+            y: Int(localY.rounded()),
+            width: max(0, Int(rect.size.width.rounded())),
+            height: max(0, Int(rect.size.height.rounded()))
+        )
+    }
+
     /// Sanitizes and truncates extracted AX strings, redacting secrets and secure field values.
     nonisolated public static func sanitizeText(
         _ raw: String?,
@@ -150,7 +178,7 @@ public actor AXInspector {
         }
 
         let rect = CGRect(origin: position, size: size)
-        guard Self.isVisibleFrame(rect, within: screenBounds) else {
+        guard let localRect = Self.displayLocalRect(rect, within: screenBounds) else {
             return nil
         }
 
@@ -179,10 +207,10 @@ public actor AXInspector {
             title: title,
             description: description,
             value: value,
-            x: Int(rect.origin.x.rounded()),
-            y: Int(rect.origin.y.rounded()),
-            width: max(0, Int(rect.size.width.rounded())),
-            height: max(0, Int(rect.size.height.rounded()))
+            x: localRect.x,
+            y: localRect.y,
+            width: localRect.width,
+            height: localRect.height
         )
     }
 

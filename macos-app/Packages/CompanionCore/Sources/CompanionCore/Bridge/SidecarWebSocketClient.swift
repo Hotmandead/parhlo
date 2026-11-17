@@ -26,15 +26,15 @@ public enum SidecarWebSocketError: Error, Sendable, Equatable {
 }
 
 private final class WebSocketDelegateProxy: NSObject, URLSessionWebSocketDelegate, @unchecked Sendable {
-    var onOpen: (@Sendable () -> Void)?
-    var onClose: (@Sendable () -> Void)?
+    var onOpen: (@Sendable (URLSessionWebSocketTask) -> Void)?
+    var onClose: (@Sendable (URLSessionWebSocketTask, String?) -> Void)?
 
     func urlSession(
         _ session: URLSession,
         webSocketTask: URLSessionWebSocketTask,
         didOpenWithProtocol protocol: String?
     ) {
-        onOpen?()
+        onOpen?(webSocketTask)
     }
 
     func urlSession(
@@ -43,7 +43,11 @@ private final class WebSocketDelegateProxy: NSObject, URLSessionWebSocketDelegat
         didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
         reason: Data?
     ) {
-        onClose?()
+        let reasonText = reason.flatMap { String(data: $0, encoding: .utf8) }
+        let description: String? = (closeCode != .normalClosure && closeCode != .invalid)
+            ? (reasonText?.isEmpty == false ? "WebSocket closed (\(closeCode.rawValue)): \(reasonText!)" : "WebSocket closed (\(closeCode.rawValue))")
+            : nil
+        onClose?(webSocketTask, description)
     }
 }
 
@@ -59,6 +63,7 @@ public final class SidecarWebSocketClient {
 
     @ObservationIgnored public var onAudioDown: (@Sendable (AudioDownMessage) -> Void)?
     @ObservationIgnored public var onBargeIn: (@Sendable (BargeInMessage) -> Void)?
+    @ObservationIgnored public var onInputTranscript: (@Sendable (InputTranscriptMessage) -> Void)?
     @ObservationIgnored public var onConnectionStateChanged: (@Sendable (WebSocketConnectionState) -> Void)?
 
     @ObservationIgnored private weak var overlayStore: OverlayStateStore?
@@ -90,14 +95,14 @@ public final class SidecarWebSocketClient {
         configuration.waitsForConnectivity = false
         self.session = URLSession(configuration: configuration, delegate: delegateProxy, delegateQueue: nil)
 
-        delegateProxy.onOpen = { [weak self] in
+        delegateProxy.onOpen = { [weak self] task in
             Task { @MainActor [weak self] in
-                self?.handleSocketOpened()
+                self?.handleSocketOpened(for: task)
             }
         }
-        delegateProxy.onClose = { [weak self] in
+        delegateProxy.onClose = { [weak self] task, reasonDescription in
             Task { @MainActor [weak self] in
-                self?.handleSocketClosedOrFailed(errorDescription: nil)
+                self?.handleSocketClosedOrFailed(for: task, errorDescription: reasonDescription)
             }
         }
     }
@@ -203,6 +208,8 @@ public final class SidecarWebSocketClient {
             onBargeIn?(bargeIn)
         case .audioDown(let chunk):
             onAudioDown?(chunk)
+        case .inputTranscript(let transcript):
+            onInputTranscript?(transcript)
         }
     }
 
@@ -242,33 +249,51 @@ public final class SidecarWebSocketClient {
                     guard let self, self.webSocketTask === task else { break }
 
                     if self.connectionState != .connected {
-                        self.handleSocketOpened()
+                        self.handleSocketOpened(for: task)
                     }
 
                     switch message {
                     case .string(let text):
-                        _ = try? self.handleIncomingText(text)
+                        do {
+                            try self.handleIncomingText(text)
+                        } catch {
+                            self.lastErrorDescription = "Failed to decode sidecar message: \(error.localizedDescription)"
+                        }
                     case .data(let data):
-                        _ = try? self.handleIncomingData(data)
+                        do {
+                            try self.handleIncomingData(data)
+                        } catch {
+                            self.lastErrorDescription = "Failed to decode sidecar binary message: \(error.localizedDescription)"
+                        }
                     @unknown default:
                         break
                     }
                 } catch {
                     guard let self, self.webSocketTask === task, !Task.isCancelled else { break }
-                    self.handleSocketClosedOrFailed(errorDescription: error.localizedDescription)
+                    self.handleSocketClosedOrFailed(for: task, errorDescription: error.localizedDescription)
                     break
                 }
             }
         }
     }
 
-    private func handleSocketOpened() {
+    internal var activeWebSocketTaskForTesting: URLSessionWebSocketTask? {
+        webSocketTask
+    }
+
+    internal func makeDetachedTaskForTesting() -> URLSessionWebSocketTask {
+        session.webSocketTask(with: url)
+    }
+
+    internal func handleSocketOpened(for task: URLSessionWebSocketTask) {
+        guard self.webSocketTask === task else { return }
         reconnectAttempt = 0
         lastErrorDescription = nil
         updateConnectionState(.connected)
     }
 
-    private func handleSocketClosedOrFailed(errorDescription: String?) {
+    internal func handleSocketClosedOrFailed(for task: URLSessionWebSocketTask, errorDescription: String?) {
+        guard self.webSocketTask === task else { return }
         guard shouldStayConnected else {
             updateConnectionState(.disconnected)
             return
