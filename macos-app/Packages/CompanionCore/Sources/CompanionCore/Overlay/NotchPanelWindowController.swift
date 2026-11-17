@@ -256,7 +256,7 @@ public final class NotchPanelWindowController {
                 activeScreen = matchedScreen
                 setExpanded(true, activateApp: false, on: matchedScreen)
             } else if screens.isEmpty {
-                let fallbackFrame = (activeScreen ?? panel.screen ?? NSScreen.main)?.frame
+                let fallbackFrame = resolvedTargetScreen()?.frame
                     ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
                 if Self.isPointInTopTriggerZone(point, screenFrame: fallbackFrame) {
                     hoverCollapseTask?.cancel()
@@ -268,7 +268,7 @@ public final class NotchPanelWindowController {
             return
         }
 
-        let currentScreenFrame = (activeScreen ?? panel.screen ?? NSScreen.main ?? screens.first)?.frame
+        let currentScreenFrame = resolvedTargetScreen()?.frame
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let insideDrawer = Self.isPointInsideExpandedDrawer(point, panelFrame: panel.frame)
         let inTriggerZone = Self.isPointInTopTriggerZone(point, screenFrame: currentScreenFrame)
@@ -292,7 +292,7 @@ public final class NotchPanelWindowController {
                 self.hoverCollapseTask = nil
 
                 let currentPoint = NSEvent.mouseLocation
-                let targetFrame = (self.activeScreen ?? self.panel.screen ?? NSScreen.main ?? NSScreen.screens.first)?.frame
+                let targetFrame = self.resolvedTargetScreen()?.frame
                     ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
                 let stillInside = Self.isPointInsideExpandedDrawer(currentPoint, panelFrame: self.panel.frame)
                     || Self.isPointInTopTriggerZone(currentPoint, screenFrame: targetFrame)
@@ -351,9 +351,22 @@ public final class NotchPanelWindowController {
         }
     }
 
+    private func resolvedTargetScreen(preferred: NSScreen? = nil) -> NSScreen? {
+        let screens = NSScreen.screens
+        if let active = activeScreen, !screens.isEmpty, !screens.contains(where: { $0 === active }) {
+            activeScreen = nil
+        }
+        if let preferred {
+            if screens.isEmpty || screens.contains(where: { $0 === preferred }) {
+                return preferred
+            }
+        }
+        return activeScreen ?? panel.screen ?? NSScreen.main ?? screens.first
+    }
+
     private func updatePanelFrame(expanded: Bool, on screen: NSScreen? = nil) {
         let targetSize = expanded ? Self.expandedSize : Self.collapsedSize
-        let targetScreen = screen ?? activeScreen ?? panel.screen ?? NSScreen.main ?? NSScreen.screens.first
+        let targetScreen = resolvedTargetScreen(preferred: screen)
         let frame = Self.frame(for: targetSize, on: targetScreen)
         if panel.frame != frame {
             panel.setFrame(frame, display: true, animate: true)

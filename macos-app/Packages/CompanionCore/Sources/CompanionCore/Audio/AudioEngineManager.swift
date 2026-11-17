@@ -208,6 +208,10 @@ public final class AudioEngineManager {
         worker.stopPlaybackImmediately()
     }
 
+    internal func setPlayingStateForTesting(_ playing: Bool) {
+        setPlayingState(playing, applyHoldoff: false)
+    }
+
     private func setPlayingState(_ playing: Bool, applyHoldoff: Bool) {
         let changed = isPlayingAudio != playing
         isPlayingAudio = playing
