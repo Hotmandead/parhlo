@@ -28,7 +28,11 @@ def get_overlay_tools() -> list[types.Tool]:
                             ),
                             "style": types.Schema(
                                 type=types.Type.STRING,
-                                description="Visual style: box or spotlight.",
+                                enum=["box", "pulse"],
+                                description=(
+                                    "Visual style: 'box' for a steady outline or "
+                                    "'pulse' for an animated pulsing spotlight ring."
+                                ),
                             ),
                             "color": types.Schema(
                                 type=types.Type.STRING,
@@ -45,7 +49,14 @@ def get_overlay_tools() -> list[types.Tool]:
                     parameters=types.Schema(
                         type=types.Type.OBJECT,
                         properties={
-                            "from_box_2d": BOX_2D_SCHEMA,
+                            "from_box_2d": types.Schema(
+                                type=types.Type.ARRAY,
+                                items=types.Schema(type=types.Type.INTEGER),
+                                description=(
+                                    "Optional origin bounding box [ymin, xmin, ymax, xmax] in 0-999. "
+                                    "If omitted, an origin near to_box_2d is chosen automatically."
+                                ),
+                            ),
                             "to_box_2d": BOX_2D_SCHEMA,
                             "label": types.Schema(
                                 type=types.Type.STRING,

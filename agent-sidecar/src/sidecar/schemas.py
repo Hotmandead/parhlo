@@ -144,7 +144,15 @@ class HudStateMessage(BaseModel):
     transcript_snippet: str | None = None
 
 
+class InputTranscriptMessage(BaseModel):
+    """Downstream live transcription of user speech from Gemini Live."""
+
+    type: Literal["input_transcript"] = "input_transcript"
+    text: str
+    is_final: bool = False
+
+
 DownstreamMessage = Annotated[
-    DrawCommandMessage | AudioDownMessage | BargeInMessage | HudStateMessage,
+    DrawCommandMessage | AudioDownMessage | BargeInMessage | HudStateMessage | InputTranscriptMessage,
     Field(discriminator="type"),
 ]

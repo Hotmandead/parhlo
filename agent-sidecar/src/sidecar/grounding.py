@@ -1,9 +1,20 @@
 """0-999 coordinate denormalization and deterministic AXUIElement bounding-box snapping."""
 
 from difflib import SequenceMatcher
+import math
 from typing import Sequence
 
 from sidecar.schemas import AXElementBounds, DetectedRectBounds, PixelRect, Point2D
+
+CONTAINER_AX_ROLES: frozenset[str] = frozenset(
+    {
+        "AXApplication",
+        "AXWindow",
+        "AXScrollArea",
+        "AXWebArea",
+        "AXGroup",
+    }
+)
 
 
 def denormalize_box(
@@ -17,7 +28,13 @@ def denormalize_box(
     if screen_width <= 0 or screen_height <= 0:
         raise ValueError("Screen dimensions must be positive")
 
-    ymin, xmin, ymax, xmax = [max(0, min(999, int(c))) for c in box_2d]
+    coords: list[int] = []
+    for c in box_2d:
+        if isinstance(c, bool) or not isinstance(c, (int, float)) or not math.isfinite(c):
+            raise ValueError(f"Invalid coordinate value in box_2d: {c!r}")
+        coords.append(max(0, min(999, int(c))))
+
+    ymin, xmin, ymax, xmax = coords
     if ymin > ymax:
         ymin, ymax = ymax, ymin
     if xmin > xmax:
@@ -82,6 +99,8 @@ def refine_with_ax_elements(
     best_score = 0.0
 
     for ax in ax_elements:
+        if ax.role in CONTAINER_AX_ROLES:
+            continue
         if ax.width <= 0 or ax.height <= 0:
             continue
         ax_rect = PixelRect(x=ax.x, y=ax.y, width=ax.width, height=ax.height)
