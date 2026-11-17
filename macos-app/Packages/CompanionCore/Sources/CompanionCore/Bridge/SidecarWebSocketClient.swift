@@ -44,9 +44,16 @@ private final class WebSocketDelegateProxy: NSObject, URLSessionWebSocketDelegat
         reason: Data?
     ) {
         let reasonText = reason.flatMap { String(data: $0, encoding: .utf8) }
-        let description: String? = (closeCode != .normalClosure && closeCode != .invalid)
-            ? (reasonText?.isEmpty == false ? "WebSocket closed (\(closeCode.rawValue)): \(reasonText!)" : "WebSocket closed (\(closeCode.rawValue))")
-            : nil
+        let description: String?
+        if closeCode != .normalClosure && closeCode != .invalid {
+            if let reasonText, !reasonText.isEmpty {
+                description = "WebSocket closed (\(closeCode.rawValue)): \(reasonText)"
+            } else {
+                description = "WebSocket closed (\(closeCode.rawValue))"
+            }
+        } else {
+            description = nil
+        }
         onClose?(webSocketTask, description)
     }
 }
@@ -61,10 +68,10 @@ public final class SidecarWebSocketClient {
     public private(set) var connectionState: WebSocketConnectionState = .disconnected
     public private(set) var lastErrorDescription: String?
 
-    @ObservationIgnored public var onAudioDown: (@Sendable (AudioDownMessage) -> Void)?
-    @ObservationIgnored public var onBargeIn: (@Sendable (BargeInMessage) -> Void)?
-    @ObservationIgnored public var onInputTranscript: (@Sendable (InputTranscriptMessage) -> Void)?
-    @ObservationIgnored public var onConnectionStateChanged: (@Sendable (WebSocketConnectionState) -> Void)?
+    @ObservationIgnored public var onAudioDown: (@MainActor @Sendable (AudioDownMessage) -> Void)?
+    @ObservationIgnored public var onBargeIn: (@MainActor @Sendable (BargeInMessage) -> Void)?
+    @ObservationIgnored public var onInputTranscript: (@MainActor @Sendable (InputTranscriptMessage) -> Void)?
+    @ObservationIgnored public var onConnectionStateChanged: (@MainActor @Sendable (WebSocketConnectionState) -> Void)?
 
     @ObservationIgnored private weak var overlayStore: OverlayStateStore?
     @ObservationIgnored private let initialReconnectDelay: TimeInterval
@@ -110,6 +117,7 @@ public final class SidecarWebSocketClient {
     deinit {
         receiveTask?.cancel()
         reconnectTask?.cancel()
+        session.invalidateAndCancel()
     }
 
     public func attachOverlayStore(_ store: OverlayStateStore?) {

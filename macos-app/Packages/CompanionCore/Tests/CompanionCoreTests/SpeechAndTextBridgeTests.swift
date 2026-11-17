@@ -376,4 +376,200 @@ struct SpeechAndTextBridgeTests {
         coordinator.isSessionActive = false
         coordinator.webSocketClient.disconnect()
     }
+
+    @Test("SpeechRecognitionManager.start aborts cleanly if stop is called during async authorization")
+    @MainActor
+    func speechManagerStopDuringAuthorizationCancelsStart() async {
+        let manager = SpeechRecognitionManager()
+        var startedCount = 0
+        var authContinuation: CheckedContinuation<Bool, Never>?
+
+        manager.authorizationOverride = {
+            await withCheckedContinuation { continuation in
+                authContinuation = continuation
+            }
+        }
+        manager.recognitionStartOverride = {
+            startedCount += 1
+        }
+
+        let startTask = Task { @MainActor in
+            await manager.start()
+        }
+        await Task.yield()
+
+        manager.stop()
+        authContinuation?.resume(returning: true)
+        await startTask.value
+
+        #expect(startedCount == 0)
+        #expect(manager.isListening == false)
+    }
+
+    @Test("AppCoordinator ignores stale speech start completion when privacy pause activates mid-startup")
+    @MainActor
+    func coordinatorPrivacyPauseCancelsPendingSpeechStartup() async {
+        let speech = SpeechRecognitionManager()
+        var startedCount = 0
+        var authContinuation: CheckedContinuation<Bool, Never>?
+
+        speech.authorizationOverride = {
+            await withCheckedContinuation { continuation in
+                authContinuation = continuation
+            }
+        }
+        speech.recognitionStartOverride = {
+            startedCount += 1
+        }
+
+        let coordinator = AppCoordinator(
+            sidecarURL: URL(string: "ws://127.0.0.1:1")!,
+            speechManager: speech
+        )
+        coordinator.isSessionActive = true
+        let startGen = coordinator.captureCycleGeneration
+
+        let startupTask = Task { @MainActor in
+            await coordinator.startSpeechRecognitionIfActive(expectedCaptureGeneration: startGen)
+        }
+        await Task.yield()
+
+        // Protected app activates while speech authorization is pending.
+        coordinator.privacyFilter.evaluateFrontmostApplication(
+            bundleIdentifier: "com.1password.1password",
+            appName: "1Password"
+        )
+        authContinuation?.resume(returning: true)
+        await startupTask.value
+
+        #expect(startedCount == 0)
+        #expect(speech.isListening == false)
+        #expect(coordinator.isUsingSidecarAudioFallback == false)
+
+        coordinator.isSessionActive = false
+        coordinator.webSocketClient.disconnect()
+    }
+
+    @Test("AppCoordinator.stopSession commits sidecar fallback input transcript without re-sending prompt")
+    @MainActor
+    func stopSessionCommitsFallbackTranscriptLocallyWithoutDuplicateSend() async {
+        struct ForbiddenOfflineQA: OfflineQASession {
+            func answer(prompt: String, context: OfflineScreenContext) async throws -> String {
+                Issue.record("stopSession should commit fallback transcript locally without invoking sendTextPrompt/offline fallback")
+                return "Unexpected"
+            }
+        }
+
+        let store = OverlayStateStore()
+        let coordinator = AppCoordinator(
+            sidecarURL: URL(string: "ws://127.0.0.1:1")!,
+            overlayStore: store,
+            offlineEngine: ForbiddenOfflineQA()
+        )
+        coordinator.backendMode = .auto
+        coordinator.isSessionActive = true
+        coordinator.enableSidecarAudioFallbackForTesting(true)
+        let initialCount = store.messages.count
+
+        coordinator.handleFallbackInputTranscript(
+            InputTranscriptMessage(text: "Explain this stack trace", isFinal: false)
+        )
+        #expect(store.dictationText == "Explain this stack trace")
+
+        coordinator.stopSession()
+        try? await Task.sleep(for: .milliseconds(50))
+
+        #expect(store.dictationText == "")
+        #expect(store.hudState == .idle)
+        #expect(store.messages.count == initialCount + 1)
+        #expect(store.messages.last?.isUser == true)
+        #expect(store.messages.last?.text == "Explain this stack trace")
+
+        coordinator.webSocketClient.disconnect()
+    }
+
+    @Test("AppCoordinator processes downstream barge_in synchronously before subsequent hud_state")
+    @MainActor
+    func downstreamBargeInResetsStreamingTurnBeforeNextHudState() throws {
+        let store = OverlayStateStore()
+        let coordinator = AppCoordinator(
+            sidecarURL: URL(string: "ws://127.0.0.1:1")!,
+            overlayStore: store
+        )
+        let initialCount = store.messages.count
+
+        try coordinator.webSocketClient.handleIncomingText(
+            #"{"type":"hud_state","state":"listening","transcript_snippet":"First turn"}"#
+        )
+        try coordinator.webSocketClient.handleIncomingText(
+            #"{"type":"barge_in","reason":"vad_interrupted"}"#
+        )
+        try coordinator.webSocketClient.handleIncomingText(
+            #"{"type":"hud_state","state":"listening","transcript_snippet":"Second turn"}"#
+        )
+
+        #expect(store.messages.count == initialCount + 2)
+        #expect(store.messages[initialCount].text == "First turn")
+        #expect(store.messages[initialCount + 1].text == "Second turn")
+
+        coordinator.webSocketClient.disconnect()
+    }
+
+    @Test("AppCoordinator preserves early speech buffers on local VAD barge-in while resetting on normal playback end")
+    @MainActor
+    func localBargeInDoesNotResetSpeechTranscript() async {
+        let speech = SpeechRecognitionManager()
+        let coordinator = AppCoordinator(
+            sidecarURL: URL(string: "ws://127.0.0.1:1")!,
+            speechManager: speech
+        )
+        coordinator.isSessionActive = true
+
+        coordinator.audioManager.setPlayingStateForTesting(true)
+        #expect(speech.resetTranscriptCountForTesting == 1)
+
+        // Local VAD barge-in stops playback without resetting the newly started user speech buffers.
+        coordinator.audioManager.onLocalVoiceActivity?()
+        try? await Task.sleep(for: .milliseconds(40))
+        #expect(coordinator.audioManager.isPlayingAudio == false)
+        #expect(speech.resetTranscriptCountForTesting == 1)
+
+        // Normal playback completion (without local barge-in) resets stale recognizer state.
+        coordinator.audioManager.setPlayingStateForTesting(true)
+        #expect(speech.resetTranscriptCountForTesting == 2)
+        coordinator.audioManager.setPlayingStateForTesting(false)
+        #expect(speech.resetTranscriptCountForTesting == 3)
+
+        coordinator.isSessionActive = false
+        coordinator.webSocketClient.disconnect()
+    }
+
+    @Test("AppCoordinator.runOfflineFallback exits thinking state when offline reply is empty")
+    @MainActor
+    func offlineFallbackEmptyReplyResetsThinkingState() async {
+        struct EmptyOfflineQA: OfflineQASession {
+            func answer(prompt: String, context: OfflineScreenContext) async throws -> String {
+                "   \n  "
+            }
+        }
+
+        let store = OverlayStateStore()
+        let coordinator = AppCoordinator(
+            sidecarURL: URL(string: "ws://127.0.0.1:1")!,
+            overlayStore: store,
+            offlineEngine: EmptyOfflineQA()
+        )
+        coordinator.privacyFilter.addExcludedBundleID(
+            Bundle.main.bundleIdentifier ?? "com.apple.dt.xctest.tool"
+        )
+        coordinator.privacyFilter.evaluateFrontmostApplication(
+            bundleIdentifier: Bundle.main.bundleIdentifier ?? "com.apple.dt.xctest.tool",
+            appName: "TestRunner"
+        )
+
+        await coordinator.runOfflineFallback(for: "Hello?")
+        #expect(store.hudState == .idle)
+
+        coordinator.webSocketClient.disconnect()
+    }
 }
