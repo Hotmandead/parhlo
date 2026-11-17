@@ -16,7 +16,7 @@ RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -e "/app/agent-sidecar[dev]"
 
 COPY agent-sidecar/tests /app/agent-sidecar/tests
-CMD ["python", "-m", "sidecar.server"]
+CMD ["watchfiles", "--filter", "python", "python -m sidecar.server", "/app/agent-sidecar/src"]
 
 FROM base AS prod
 COPY agent-sidecar/pyproject.toml /app/agent-sidecar/pyproject.toml
