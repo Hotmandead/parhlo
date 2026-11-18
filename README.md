@@ -14,6 +14,12 @@ A native macOS screen-aware AI assistant optimized for Apple Silicon (`arm64-app
 | **Phase 3: Capture, Vision Redaction & Bridge** | Completed | `PrivacyFilter`, `VisionRedactor`, `AXInspector`, `CaptureEngine`, `SidecarWebSocketClient` |
 | **Phase 4: Bidirectional Audio, Hotkey & E2E** | Completed | `AudioEngineManager` (`AVAudioEngine` AEC), `GlobalHotkeyManager` (`Control+Option`), `AppCoordinator`, `SettingsView`, E2E check |
 | **Phase 5: Apple Native Intelligence Upgrades** | Completed | `VisionGrounder` (`VNDetectRectanglesRequest` + `RecognizeDocumentsRequest`), `SemanticPrivacyClassifier` (`FoundationModels` + LRU cache), `OfflineAssistantEngine` + `OfflineSpeechManager` (`AVSpeechSynthesizer`) |
+| **Phase 6: OCR Layout & Phrase Grounding** | Planned | `OCRBlockBounds` (heading & word-span coordinates), `refine_with_ocr_blocks` in `grounding.py`, high-DPI ROI crops |
+| **Phase 7: Mouse-Spin Gesture & Teacher Pointer** | Planned | `MouseGestureTracker` (`⌃⌥` circular mouse lasso), `TeacherPointerController` (virtual teacher laser + opt-in `CGEvent` cursor guidance with hardware breakaway) |
+| **Phase 8: Expressive Teacher Overlay** | Planned | `underline_text` (`solid`, `wavy`, `marker`), `bracket_region`, `circle_region`, anti-collision margin callouts |
+| **Phase 9: Pedagogical AI Persona** | Planned | Structured visual tutor choreography (Heading Underline → Pointer Glide → Key-Phrase Marker → Margin Summary) |
+
+See [CHANGELOG.md](CHANGELOG.md) for full details on Phases 1–5 and [implementation_plan.md](implementation_plan.md) for the Phase 6–9 architecture.
 
 ## Quick Start
 
