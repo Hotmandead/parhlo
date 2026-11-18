@@ -5,7 +5,7 @@
   - `docker compose build`
   - `docker compose run --rm sidecar pytest -v`
   - `docker compose up`
-- Dependencies are declared in `agent-sidecar/pyproject.toml` (`google-genai>=2.3.0`, `websockets>=13.0`, `pydantic>=2.9.0`).
+- Dependencies are declared in `agent-sidecar/pyproject.toml` (`google-genai>=3.2.0`, `websockets>=13.0`, `pydantic>=2.9.0`; `dev`: `pytest`, `pytest-asyncio`, `watchfiles`).
 
 ## Coding & Protocol Standards
 - Use **Pydantic v2** strict discriminated unions in `src/sidecar/schemas.py` (`UpstreamMessage`, `DownstreamMessage`).

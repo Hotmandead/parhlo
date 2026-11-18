@@ -1,0 +1,40 @@
+# Parhlo macOS Screen-Aware Assistant Rules
+
+## Project & Target Environment
+- **Workspace:** `Parhlo.xcworkspace` (project: `macos-app/Parhlo.xcodeproj`)
+- **Detected Schemes:** `Parhlo` (macOS app target), `CompanionCore` (local Swift package at `macos-app/Packages/CompanionCore`)
+- **Bundle Identifier:** `com.parhlo.ScreenCompanionApp`
+- **Target Platform:** macOS 14.0+ (`MACOSX_DEPLOYMENT_TARGET = 14.0`), Apple Silicon (`arm64`)
+- **Language & Frameworks:** Swift 6 (`SWIFT_VERSION = 6.0`, strict concurrency), SwiftUI + AppKit (`NSPanel`)
+
+## Source Layout
+- `macos-app/Parhlo/` — App entry point (`ParhloApp.swift`), `Info.plist`, and `Parhlo.entitlements`.
+- `macos-app/Packages/CompanionCore/Sources/CompanionCore/` — Core modules (`Capture/`, `Overlay/`, `App/`, `Bridge/`, `Models/`, `Permissions/`, `Audio/`).
+- `macos-app/Packages/CompanionCore/Tests/CompanionCoreTests/` — Swift unit tests.
+- `agent-sidecar/` — Dockerized Python 3.12 Gemini Live API sidecar (`ws://127.0.0.1:8765`).
+
+## Core Thin-Client Stack
+- **Screen Capture:** `ScreenCaptureKit` (`SCStream`, `SCContentFilter`, `SCStreamConfiguration`).
+- **On-Device Vision & ML:** `Vision` (`VNGenerateImageFeaturePrintRequest` for frame diffing, text/UI grounding, and redaction) and `CoreML`.
+- **AI Backend:** `google-genai` SDK (via the `agent-sidecar` stateless proxy over local WebSocket).
+
+## Hard Architectural Constraints
+1. **No Deprecated Capture APIs:** Strictly prohibit `CGWindowListCreateImage` and `CGDisplayCreateImage`. Use `ScreenCaptureKit` (`SCStream` / `SCScreenshotManager`) exclusively.
+2. **Non-Activating Overlay Panels:** All floating HUD and notch overlays must use borderless `NSPanel` subclasses with `.nonactivatingPanel` style mask so active user applications never lose focus.
+3. **Feedback Loop Prevention:** Always exclude the app's own `SCWindow` instances and host bundle ID (`com.parhlo.ScreenCompanionApp`) from `SCContentFilter`, and set `window.sharingType = .none` on overlay panels.
+4. **No Hardcoded Secrets:** Never hardcode Gemini API keys, tokens, or credentials in Swift or Python source files. Read secrets from environment variables (`.env`, excluded from git) or macOS Keychain.
+5. **Swift 6 Concurrency:** Isolate `NSPanel`, `NSWindow`, `NSStatusItem`, `CAShapeLayer`, and observable UI state to `@MainActor`. Keep `ScreenCaptureKit` buffer processing and `Vision` / `CoreML` inference off `@MainActor`.
+
+## Build & Test Commands
+- **Clean Build (`Parhlo` scheme):**
+  ```bash
+  xcodebuild clean build -workspace Parhlo.xcworkspace -scheme Parhlo -configuration Debug -destination 'platform=macOS,arch=arm64'
+  ```
+- **Run App & Package Tests (`Parhlo` scheme):**
+  ```bash
+  xcodebuild test -workspace Parhlo.xcworkspace -scheme Parhlo -configuration Debug -destination 'platform=macOS,arch=arm64'
+  ```
+- **Fast Package Unit Tests (`CompanionCore`):**
+  ```bash
+  cd macos-app/Packages/CompanionCore && swift test
+  ```
