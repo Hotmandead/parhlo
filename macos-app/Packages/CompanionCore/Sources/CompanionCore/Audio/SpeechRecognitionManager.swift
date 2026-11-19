@@ -67,6 +67,9 @@ public final class SpeechRecognitionManager {
     @ObservationIgnored private var didReceiveTranscriptInCurrentTask: Bool = false
     @ObservationIgnored private var usedOnDeviceFallback: Bool = false
     @ObservationIgnored private var consecutiveErrorCount: Int = 0
+    @ObservationIgnored internal var authorizationOverride: (@MainActor () async -> Bool)?
+    @ObservationIgnored internal var recognitionStartOverride: (@MainActor () -> Void)?
+    @ObservationIgnored internal private(set) var resetTranscriptCountForTesting: Int = 0
 
     public init(locale: Locale = .current) {
         self.recognizer = SFSpeechRecognizer(locale: locale) ?? SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
@@ -78,6 +81,9 @@ public final class SpeechRecognitionManager {
 
     /// Requests Speech Recognition authorization if not yet determined, returning whether recognition is authorized.
     public func ensureAuthorized() async -> Bool {
+        if let authorizationOverride {
+            return await authorizationOverride()
+        }
         let current = SFSpeechRecognizer.authorizationStatus()
         if current == .authorized {
             return true
@@ -96,16 +102,28 @@ public final class SpeechRecognitionManager {
     /// Starts an on-device (when supported) streaming `SFSpeechAudioBufferRecognitionRequest`.
     public func start() async {
         stop()
+        let startGeneration = sessionGeneration
         lastError = nil
         latestTranscript = ""
         committedTranscriptPrefix = ""
         didReceiveTranscriptInCurrentTask = false
         usedOnDeviceFallback = false
 
-        guard await ensureAuthorized() else {
+        let authorized = await ensureAuthorized()
+        guard sessionGeneration == startGeneration else {
+            return
+        }
+        guard authorized else {
             if let lastError {
                 onError?(lastError)
             }
+            return
+        }
+        if let recognitionStartOverride {
+            shouldRemainListening = true
+            consecutiveErrorCount = 0
+            isListening = true
+            recognitionStartOverride()
             return
         }
         guard let recognizer, recognizer.isAvailable else {
@@ -125,6 +143,7 @@ public final class SpeechRecognitionManager {
 
     /// Clears accumulated transcripts and restarts the recognition request when actively listening.
     public func resetTranscript() {
+        resetTranscriptCountForTesting += 1
         latestTranscript = ""
         committedTranscriptPrefix = ""
         didReceiveTranscriptInCurrentTask = false

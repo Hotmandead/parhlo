@@ -8,7 +8,7 @@
 - Compile cleanly under **Swift 6 strict concurrency**.
 - Isolate all `NSWindow`, `NSStatusItem`, `CAShapeLayer`, and SwiftUI observable state to `@MainActor`.
 - Keep synchronous C-API calls (`AXUIElementCopyAttributeValue`, `Vision` OCR requests) off `@MainActor` (use dedicated background actors or `Task.detached`).
-- Keep `CompanionCore` DTOs (`PixelRect`, `Point2D`, `DrawCommand`, `HudState`, etc.) `Sendable` and `Codable`, matching `../agent-sidecar/src/sidecar/schemas.py`.
+- Keep `CompanionCore` DTOs (`PixelRect`, `Point2D`, `DrawCommandMessage`, `HudState`, `InputTranscriptMessage`, etc.) `Sendable` and `Codable`, matching `../agent-sidecar/src/sidecar/schemas.py`.
 - Never force-unwrap (`!`) optionals in runtime paths; use `guard` / explicit error handling.
 
 ## Overlay, Capture & Audio Invariants
